@@ -177,7 +177,7 @@ def _parse_args() -> argparse.Namespace:
     # Subagent SFT
     parser.add_argument("--sft_epochs", type=int, default=3)
     parser.add_argument("--sft_lr", type=float, default=2e-4)
-    parser.add_argument("--sft_max_seq_len", type=int, default=4096)
+    parser.add_argument("--sft_max_seq_len", type=int, default=8192)
     parser.add_argument("--sft_bs", type=int, default=1)
     parser.add_argument("--sft_grad_accum", type=int, default=8)
     parser.add_argument("--sft_max_steps", type=int, default=-1)
@@ -188,10 +188,21 @@ def _parse_args() -> argparse.Namespace:
 
     # Manager GRPO
     parser.add_argument("--mgr_bs", type=int, default=2)
-    parser.add_argument("--mgr_max_completion_length", type=int, default=2048)
+    parser.add_argument("--mgr_max_completion_length", type=int, default=1024)
     parser.add_argument("--mgr_temperature", type=float, default=0.9)
+    parser.add_argument("--mgr_top_p", type=float, default=0.95)
+    parser.add_argument("--mgr_top_k", type=int, default=20)
+    parser.add_argument("--mgr_min_p", type=float, default=0.0)
+    parser.add_argument("--mgr_enable_thinking", action="store_true",
+                        help="Enable Qwen thinking during GRPO rollouts. Main ADC runs "
+                             "remain non-thinking; use this as a separate ablation.")
     parser.add_argument("--mgr_num_generations", type=int, default=6)
-    parser.add_argument("--mgr_grpo_beta", type=float, default=0.01)
+    parser.add_argument("--mgr_generation_batch_size", type=int, default=0,
+                        help="Optional number of completions generated at once. "
+                             "Use 8 with bs=8, generations=8 to retain a global "
+                             "batch of 24 while lowering rollout peak memory.")
+    parser.add_argument("--mgr_learning_rate", type=float, default=1e-6)
+    parser.add_argument("--mgr_grpo_beta", type=float, default=0.001)
     parser.add_argument("--mgr_routing_efficiency_bonus", type=float, default=0.0)
     parser.add_argument("--mgr_tool_use_bonus", type=float, default=0.0,
                         help="Bonus added only when the final answer is correct and at least one native tool was called.")
@@ -268,7 +279,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--coldstart_draft_source", type=str, default="base_stepwise",
                         choices=["base_stepwise", "base_initial", "oracle"],
                         help="Source for DRAFT_ANSWER labels. 'base_stepwise' re-elicits "
-                             "the base manager after every advisor output (recommended); "
+                             "the base manager after every sub-agent output (recommended); "
                              "'base_initial' repeats one pre-tool prediction; 'oracle' "
                              "reproduces the old ground-truth-draft ablation.")
     parser.add_argument("--coldstart_draft_max_new_tokens", type=int, default=256,
@@ -303,11 +314,19 @@ def _parse_args() -> argparse.Namespace:
                         help="Manager checkpoint/adapter path, or reserved value 'base' "
                              "to evaluate --base_model directly without tools.")
     parser.add_argument("--eval_temperature", type=float, default=0.0)
-    parser.add_argument("--eval_max_new_tokens", type=int, default=1024)
+    parser.add_argument("--eval_max_new_tokens", type=int, default=256)
+    parser.add_argument("--eval_max_total_manager_tokens", type=int, default=0,
+                        help="Optional total manager-generation cap across all tool turns. "
+                             "Use 1024 to match the strict routing-only Qwen3.5 Manager; 0 disables.")
+    parser.add_argument("--eval_enable_thinking", action="store_true",
+                        help="Explicitly enable the model's thinking chat template during evaluation.")
+    parser.add_argument("--eval_top_p", type=float, default=0.95)
+    parser.add_argument("--eval_top_k", type=int, default=20)
+    parser.add_argument("--eval_min_p", type=float, default=0.0)
     parser.add_argument("--eval_max_tool_calls", type=int, default=3)
     parser.add_argument("--eval_forced_tools", type=str, default="none",
                         help="Fixed delegation sequence for eval_manager_forced: comma-separated "
-                             "advisor kinds, e.g. 'extractor,reasoner,verifier', or 'none' for "
+                             "sub-agent kinds, e.g. 'extractor,reasoner,verifier', or 'none' for "
                              "the zero-delegation baseline. Running every subset yields fixed-k "
                              "baselines and the per-question stopping oracle.")
     parser.add_argument("--eval_out_tag", type=str, default="",
@@ -710,7 +729,13 @@ def main() -> None:
             per_device_batch_size=args.mgr_bs,
             max_completion_length=args.mgr_max_completion_length,
             temperature=args.mgr_temperature,
+            top_p=args.mgr_top_p,
+            top_k=args.mgr_top_k,
+            min_p=args.mgr_min_p,
+            enable_thinking=args.mgr_enable_thinking,
             num_generations=args.mgr_num_generations,
+            generation_batch_size=args.mgr_generation_batch_size,
+            learning_rate=args.mgr_learning_rate,
             grpo_beta=args.mgr_grpo_beta,
             routing_efficiency_bonus=args.mgr_routing_efficiency_bonus,
             tool_use_bonus=args.mgr_tool_use_bonus,
@@ -836,7 +861,13 @@ def main() -> None:
             per_device_batch_size=args.mgr_bs,
             max_completion_length=args.mgr_max_completion_length,
             temperature=args.mgr_temperature,
+            top_p=args.mgr_top_p,
+            top_k=args.mgr_top_k,
+            min_p=args.mgr_min_p,
+            enable_thinking=args.mgr_enable_thinking,
             num_generations=args.mgr_num_generations,
+            generation_batch_size=args.mgr_generation_batch_size,
+            learning_rate=args.mgr_learning_rate,
             grpo_beta=args.mgr_grpo_beta,
             routing_efficiency_bonus=args.mgr_routing_efficiency_bonus,
             tool_use_bonus=args.mgr_tool_use_bonus,
@@ -904,6 +935,11 @@ def main() -> None:
             sc_k=args.eval_sc_k,
             sc_temperature=args.eval_sc_temperature,
             per_task=args.eval_per_task,
+            enable_thinking=args.eval_enable_thinking,
+            top_p=args.eval_top_p,
+            top_k=args.eval_top_k,
+            min_p=args.eval_min_p,
+            out_tag=args.eval_out_tag,
         )
         print("[EVAL_MANAGER]", result)
         return
@@ -923,6 +959,10 @@ def main() -> None:
             out_tag=args.eval_out_tag,
             per_task=args.eval_per_task,
             subagent_server_url=args.subagent_server_url,
+            enable_thinking=args.eval_enable_thinking,
+            top_p=args.eval_top_p,
+            top_k=args.eval_top_k,
+            min_p=args.eval_min_p,
         )
         print("[EVAL_MANAGER_FORCED]", result)
         return
@@ -935,9 +975,15 @@ def main() -> None:
             temperature=args.eval_temperature,
             max_new_tokens=args.eval_max_new_tokens,
             max_tool_calls=args.eval_max_tool_calls,
+            max_total_manager_tokens=args.eval_max_total_manager_tokens,
             task_description=args.task_description,
             per_task=args.eval_per_task,
             subagent_server_url=args.subagent_server_url,
+            enable_thinking=args.eval_enable_thinking,
+            top_p=args.eval_top_p,
+            top_k=args.eval_top_k,
+            min_p=args.eval_min_p,
+            out_tag=args.eval_out_tag,
         )
         print("[EVAL_MANAGER_TOOLS]", result)
         return

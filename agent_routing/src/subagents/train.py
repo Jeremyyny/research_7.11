@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from ..utils.io import read_jsonl
+from ..utils.modeling import discover_lora_target_modules, load_text_causal_lm
 from ..utils.seed import set_seed
 
 try:
@@ -42,7 +43,7 @@ class SFTConfig:
     out_dir: str
     dev_jsonl: Optional[str] = None
     seed: int = 42
-    max_seq_len: int = 4096
+    max_seq_len: int = 8192
     learning_rate: float = 2e-4
     num_train_epochs: int = 3
     per_device_batch_size: int = 1
@@ -84,12 +85,6 @@ def _tokenize_subagent_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) ->
     return ds.map(_map, remove_columns=ds.column_names)
 
 
-def _lora_target_modules(model) -> List[str]:
-    candidates = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    present = {name.split(".")[-1] for name, _ in model.named_modules()}
-    return [name for name in candidates if name in present] or ["q_proj", "v_proj"]
-
-
 def train_subagent_sft(cfg: SFTConfig) -> None:
     from transformers import DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
@@ -105,13 +100,13 @@ def train_subagent_sft(cfg: SFTConfig) -> None:
         tok.pad_token_id = tok.eos_token_id
 
     dtype = torch.bfloat16 if (cfg.bf16 and device == "cuda") else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_text_causal_lm(
         cfg.base_model, torch_dtype=dtype, trust_remote_code=True
     ).to(device)
     model.config.use_cache = False
 
     if cfg.use_lora:
-        target = _lora_target_modules(model)
+        target = discover_lora_target_modules(model)
         lora_cfg = LoraConfig(
             r=cfg.lora_r,
             lora_alpha=cfg.lora_alpha,

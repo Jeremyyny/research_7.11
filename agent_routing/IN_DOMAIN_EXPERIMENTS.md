@@ -2,21 +2,21 @@
 
 This document is the canonical execution plan. Every benchmark is trained and
 evaluated independently. **There is no cross-domain manager transfer in the
-main experiment.** Each benchmark receives its own advisor adapters,
+main experiment.** Each benchmark receives its own sub-agent adapters,
 cold-start adapter, GRPO checkpoints, held-out questions, W&B namespace, and
 statistical report.
 
 ## 1. Final design
 
-| Benchmark | Training source | Advisor / cold-start / GRPO unique questions | Dev | Held-out pool | Final report |
+| Benchmark | Training source | Sub-agent / cold-start / GRPO unique questions | Dev | Held-out pool | Final report |
 |---|---|---:|---:|---:|---:|
 | MedQA | Official train | 800 / 400 / 1,800 | 300 | 500 | 300 |
 | LegalBench large5 | Remaining rows after balanced holdout | 600 / 300 / remainder (~1,234) | 200 (40/task) | 500 (100/task) | 300 (60/task) |
 | MMLU-Pro | Frozen custom in-domain partition | 900 / 400 / 2,700 | 300 | 500 | 300 |
 | GPQA | Extended minus every Diamond question | 100 / 40 / 178 | 30 | all Diamond 198 | all 198 |
 
-All partitions use `seed=42`. Advisor SFT, cold-start, GRPO, dev, and test are
-question-hash disjoint. The three advisor roles share the same advisor-SFT
+All partitions use `seed=42`. Sub-agent SFT, cold-start, GRPO, dev, and test are
+question-hash disjoint. The three sub-agent roles share the same sub-agent-SFT
 question set within a benchmark; this allows paired specialization and subset
 analysis without consuming three times as many unique questions.
 
@@ -31,22 +31,33 @@ source /home/yizzhao/research_0703/.venv/bin/activate
 pip install -r requirements.txt accelerate deepspeed requests
 
 export PYTHONUTF8=1
-export BASE_MODEL=Qwen/Qwen3-8B
+export BASE_MODEL=Qwen/Qwen3.5-9B   # use Qwen/Qwen3.5-4B for the smaller scale
 export SEED=42
 export DEEPSEEK_BASE_URL=http://localhost:8001/v1
 export DEEPSEEK_MODEL=deepseek-ai/DeepSeek-V3
+
+# Qwen3.5-4B tolerates the slightly larger LoRA SFT rate; keep 9B conservative.
+if [[ "$BASE_MODEL" == *"3.5-4B"* ]]; then
+  export SUBAGENT_SFT_LR=1e-4
+else
+  export SUBAGENT_SFT_LR=5e-5
+fi
+
+export SUBAGENT_EXTRACTOR_MAX_NEW_TOKENS=512
+export SUBAGENT_REASONER_MAX_NEW_TOKENS=1024
+export SUBAGENT_VERIFIER_MAX_NEW_TOKENS=768
 ```
 
 The local DeepSeek endpoint must accept OpenAI-compatible
 `/v1/chat/completions`. If a hosted endpoint is used, change
 `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`, and `OPENAI_API_KEY`.
 
-Run DeepSeek synthesis before starting the advisor server if both use GPU 0.
-After the three advisor adapters are trained, stop DeepSeek and start:
+Run DeepSeek synthesis before starting the sub-agent server if both use GPU 0.
+After the three sub-agent adapters are trained, stop DeepSeek and start:
 
 ```bash
 conda activate vllm_env
-bash scripts/start_subagent_server.sh "$BASE_MODEL" <TEACHER_ID> outputs 8000 8192
+bash scripts/start_subagent_server.sh "$BASE_MODEL" <TEACHER_ID> outputs 8000 32768
 curl -f http://localhost:8000/health
 ```
 
@@ -61,15 +72,15 @@ verifier    — Verifier LoRA
 
 ## 3. Shared quality rules
 
-Every advisor pipeline follows:
+Every sub-agent pipeline follows:
 
-1. Generate GT-blind base-manager predictions on the advisor question pool.
+1. Generate GT-blind base-manager predictions on the sub-agent question pool.
 2. Export more synthetic prompts than will be retained.
 3. Use actual manager predictions as verifier candidates.
 4. Import with schema, coverage, and symmetric choice-leakage checks.
 5. Select a deterministic unique-question subset.
 6. Audit before SFT.
-7. Exclude selected advisor questions from cold-start and GRPO by question hash.
+7. Exclude selected sub-agent questions from cold-start and GRPO by question hash.
 
 Cold-start uses:
 
@@ -79,10 +90,71 @@ Cold-start uses:
 50% teacher sequences when configured, otherwise deterministic heuristic plans
 ```
 
-The default draft mode is `base_stepwise`: after every advisor result,
+The default draft mode is `base_stepwise`: after every sub-agent result,
 including the last one, the base manager is queried again. This records every
 W→C/C→W transition and provides the updated state before either another
 delegation or stopping. `oracle` drafts are allowed only as an ablation.
+
+## 3.1 Thinking mode and token-budget policy
+
+The main ADC manager is intentionally **non-thinking**. This must be stated in
+the paper; it studies whether external, specialized deliberation can help a
+short-budget Manager route and stop. The main GRPO command has a 1,024-token
+trajectory cap. Final learned-policy evaluation uses at most 256 Manager tokens
+per turn and 1,024 Manager tokens total across at most four turns. Free-form
+Manager reasoning is prohibited; it emits only `DRAFT_ANSWER_`, native tool
+calls, and the terminal `ANSWER_` line.
+
+The main paper uses framework-internal comparisons rather than an unrestricted
+single-agent thinking baseline:
+
+| Arm | Manager budget | Sub-agent budget | Purpose |
+|---|---:|---:|---|
+| learned ADC | 256/turn, 1,024 total | role-specific | main adaptive policy |
+| forced none | 256 final turn | none | zero-delegation control |
+| forced single/pair/all | 256 final turn | role-specific | fixed-subset and oracle analysis |
+
+Role-specific completion caps are Extractor 512, Reasoner 1,024, and Verifier
+768. Every report records actual prompt/completion/total tokens, cap hits,
+complete MAS totals, cache hits, and accuracy/token usage conditioned on the
+number of tools called. A smaller number of calls must reduce actual consumed
+tokens; allocated context capacity is not counted as consumed compute.
+
+Run the suite only after the GPU-0 sub-agent server is healthy:
+
+```bash
+bash scripts/run_eval_budget_suite.sh \
+  "$ID" <EVAL_N> outputs/manager/$ID/grpo_anytime_c05 \
+  "$BASE_MODEL" "$DESC" <BENCHMARK_DATA_FLAGS>
+```
+
+`--eval_enable_thinking` is explicit. If the tokenizer cannot honor it, the
+evaluator fails instead of silently producing a mislabeled non-thinking run.
+Use `--mgr_enable_thinking` only for a separately named manager-training
+ablation; it is not part of the main ADC result.
+
+Before any final test run, perform the Manager-cap check on development rows
+only. Pass benchmark flags that make `test` empty so the evaluator selects
+`dev`; never tune these caps on the final 300 rows or GPQA-Diamond:
+
+```bash
+for SPEC in "128 512 short" "256 1024 main" "512 2048 loose"; do
+  read -r TURN TOTAL TAG <<< "$SPEC"
+  CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager_tools \
+    --base_model "$BASE_MODEL" --teacher_id "$ID" <DEV_ONLY_DATA_FLAGS> \
+    --eval_n_samples <DEV_N> \
+    --eval_manager_dir outputs/manager/$ID/grpo_anytime_c05 \
+    --subagent_server_url http://localhost:8000 \
+    --eval_max_new_tokens "$TURN" \
+    --eval_max_total_manager_tokens "$TOTAL" \
+    --eval_out_tag "manager_budget_$TAG" --task_description "$DESC"
+done
+```
+
+Keep the 256/1,024 main setting when both Manager cap-hit rate and total-budget
+exhaustion are below 2%. Increase it only after inspecting actual truncated
+outputs. For GPQA, use the non-Diamond dev rows and select by formatting/cap
+diagnostics rather than noisy 30-question accuracy.
 
 ---
 
@@ -116,7 +188,7 @@ CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli export_base_predictions \
   --task_description "$DESC"
 ```
 
-## 4.3 Export, generate, import, and select synthetic advisor data
+## 4.3 Export, generate, import, and select synthetic sub-agent data
 
 ```bash
 for KIND in extractor reasoner verifier; do
@@ -154,14 +226,14 @@ python scripts/audit_synthetic_data.py \
   --min_rows 800 --require_verifier_candidates
 ```
 
-## 4.4 Train and gate the advisors
+## 4.4 Train and gate the sub-agents
 
 ```bash
 for KIND in extractor reasoner verifier; do
   CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli train_subagent \
     --base_model "$BASE_MODEL" --teacher_id "$ID" --agent_kind "$KIND" \
     --sft_train_jsonl outputs/sft_data/$ID/${KIND}_sft_final.jsonl \
-    --sft_epochs 3 --sft_lr 5e-5 --sft_bs 1 --sft_grad_accum 8
+    --sft_epochs 3 --sft_lr "$SUBAGENT_SFT_LR" --sft_bs 1 --sft_grad_accum 8
 done
 
 CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli eval_subagents \
@@ -176,7 +248,7 @@ Terminal A:
 
 ```bash
 conda activate vllm_env
-bash scripts/start_subagent_server.sh "$BASE_MODEL" "$ID" outputs 8000 8192
+bash scripts/start_subagent_server.sh "$BASE_MODEL" "$ID" outputs 8000 32768
 ```
 
 Terminal B:
@@ -229,22 +301,9 @@ bash scripts/train_manager_grpo_multigpu.sh "$ID" \
 ## 4.7 Final 300-question evaluation
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
-  --eval_n_samples 300 --eval_manager_dir base \
-  --task_description "$DESC"
-
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
-  --eval_n_samples 300 --eval_manager_dir base \
-  --eval_sc_k 5 --eval_sc_temperature 0.7 \
-  --task_description "$DESC"
-
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager_tools \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
-  --eval_n_samples 300 --eval_manager_dir outputs/manager/$ID/grpo_anytime_c05 \
-  --subagent_server_url http://localhost:8000 \
-  --task_description "$DESC"
+bash scripts/run_eval_budget_suite.sh \
+  "$ID" 300 outputs/manager/$ID/grpo_anytime_c05 \
+  "$BASE_MODEL" "$DESC" $DARGS
 ```
 
 Run all forced subsets on the same 300 questions:
@@ -256,6 +315,7 @@ for SEQ in none extractor reasoner verifier \
   CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager_forced \
     --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
     --eval_n_samples 300 --eval_forced_tools "$SEQ" \
+    --eval_max_new_tokens 256 \
     --eval_manager_dir outputs/manager/$ID/grpo_anytime_c05 \
     --subagent_server_url http://localhost:8000 \
     --eval_out_tag "${SEQ//,/_}" --task_description "$DESC"
@@ -335,24 +395,24 @@ python scripts/audit_synthetic_data.py \
   --min_rows 600 --require_verifier_candidates
 ```
 
-The selected files must contain 120 rows per task per advisor.
+The selected files must contain 120 rows per task per sub-agent.
 
-## 5.3 Advisor SFT, cold-start, and GRPO
+## 5.3 Sub-agent SFT, cold-start, and GRPO
 
 ```bash
 for KIND in extractor reasoner verifier; do
   CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli train_subagent \
     --base_model "$BASE_MODEL" --teacher_id "$ID" --agent_kind "$KIND" \
     --sft_train_jsonl outputs/sft_data/$ID/${KIND}_sft_final.jsonl \
-    --sft_epochs 3 --sft_lr 5e-5 --sft_bs 1 --sft_grad_accum 8
+    --sft_epochs 3 --sft_lr "$SUBAGENT_SFT_LR" --sft_bs 1 --sft_grad_accum 8
 done
 
 CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli eval_subagents \
   --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS --eval_n_samples 100
 
-# Terminal A (after advisor evaluation):
+# Terminal A (after sub-agent evaluation):
 conda activate vllm_env
-bash scripts/start_subagent_server.sh "$BASE_MODEL" "$ID" outputs 8000 8192
+bash scripts/start_subagent_server.sh "$BASE_MODEL" "$ID" outputs 8000 32768
 curl -f http://localhost:8000/health
 
 # Terminal B:
@@ -389,23 +449,9 @@ bash scripts/train_manager_grpo_multigpu.sh "$ID" \
 ## 5.4 Balanced final evaluation: 60 per task
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
-  --eval_per_task 60 --eval_n_samples 300 --eval_manager_dir base \
-  --task_description "$DESC"
-
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
-  --eval_per_task 60 --eval_n_samples 300 --eval_manager_dir base \
-  --eval_sc_k 5 --eval_sc_temperature 0.7 \
-  --task_description "$DESC"
-
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager_tools \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
-  --eval_per_task 60 --eval_n_samples 300 \
-  --eval_manager_dir outputs/manager/$ID/grpo_anytime_c05 \
-  --subagent_server_url http://localhost:8000 \
-  --task_description "$DESC"
+bash scripts/run_eval_budget_suite.sh \
+  "$ID" 300 outputs/manager/$ID/grpo_anytime_c05 \
+  "$BASE_MODEL" "$DESC" $DARGS --eval_per_task 60
 ```
 
 Use `--eval_per_task 60 --eval_n_samples 300` for every LegalBench baseline and
@@ -419,6 +465,7 @@ for SEQ in none extractor reasoner verifier \
   CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager_forced \
     --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
     --eval_per_task 60 --eval_n_samples 300 --eval_forced_tools "$SEQ" \
+    --eval_max_new_tokens 256 \
     --eval_manager_dir outputs/manager/$ID/grpo_anytime_c05 \
     --subagent_server_url http://localhost:8000 \
     --eval_out_tag "${SEQ//,/_}" --task_description "$DESC"
@@ -495,14 +542,14 @@ python scripts/audit_synthetic_data.py \
   --min_rows 900 --require_verifier_candidates
 ```
 
-## 6.3 Advisor SFT, cold-start, GRPO, and final evaluation
+## 6.3 Sub-agent SFT, cold-start, GRPO, and final evaluation
 
 ```bash
 for KIND in extractor reasoner verifier; do
   CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli train_subagent \
     --base_model "$BASE_MODEL" --teacher_id "$ID" --agent_kind "$KIND" \
     --sft_train_jsonl outputs/sft_data/$ID/${KIND}_sft_final.jsonl \
-    --sft_epochs 3 --sft_lr 5e-5 --sft_bs 1 --sft_grad_accum 8
+    --sft_epochs 3 --sft_lr "$SUBAGENT_SFT_LR" --sft_bs 1 --sft_grad_accum 8
 done
 
 CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli eval_subagents \
@@ -510,7 +557,7 @@ CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli eval_subagents \
 
 # Terminal A:
 conda activate vllm_env
-bash scripts/start_subagent_server.sh "$BASE_MODEL" "$ID" outputs 8000 8192
+bash scripts/start_subagent_server.sh "$BASE_MODEL" "$ID" outputs 8000 32768
 curl -f http://localhost:8000/health
 
 # Terminal B:
@@ -543,22 +590,9 @@ bash scripts/train_manager_grpo_multigpu.sh "$ID" \
   --mgr_use_wandb --wandb_project adc_in_domain \
   --wandb_run_name ${ID}_grpo_c05 --task_description "$DESC"
 
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager_tools \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
-  --eval_n_samples 300 --eval_manager_dir outputs/manager/$ID/grpo_anytime_c05 \
-  --subagent_server_url http://localhost:8000 \
-  --task_description "$DESC"
-
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
-  --eval_n_samples 300 --eval_manager_dir base \
-  --task_description "$DESC"
-
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
-  --eval_n_samples 300 --eval_manager_dir base \
-  --eval_sc_k 5 --eval_sc_temperature 0.7 \
-  --task_description "$DESC"
+bash scripts/run_eval_budget_suite.sh \
+  "$ID" 300 outputs/manager/$ID/grpo_anytime_c05 \
+  "$BASE_MODEL" "$DESC" $DARGS
 
 for SEQ in none extractor reasoner verifier \
   extractor,reasoner extractor,verifier reasoner,verifier \
@@ -566,6 +600,7 @@ for SEQ in none extractor reasoner verifier \
   CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager_forced \
     --base_model "$BASE_MODEL" --teacher_id "$ID" $DARGS \
     --eval_n_samples 300 --eval_forced_tools "$SEQ" \
+    --eval_max_new_tokens 256 \
     --eval_manager_dir outputs/manager/$ID/grpo_anytime_c05 \
     --subagent_server_url http://localhost:8000 \
     --eval_out_tag "${SEQ//,/_}" --task_description "$DESC"
@@ -592,7 +627,7 @@ export TRAIN_ARGS="--gpqa_normalized_cache $TRAIN --train_size 318 --dev_size 30
 export TEST_ARGS="--gpqa_normalized_cache $TEST --train_size 0 --dev_size 0 --test_size 198 --seed $SEED"
 ```
 
-No Diamond question may appear in advisor synthesis, base predictions,
+No Diamond question may appear in sub-agent synthesis, base predictions,
 cold-start, GRPO, dev selection, prompt tuning, or reward tuning.
 
 ## 7.2 Base predictions and synthetic data
@@ -639,14 +674,14 @@ python scripts/audit_synthetic_data.py \
   --min_rows 100 --require_verifier_candidates
 ```
 
-## 7.3 Advisor SFT, 40-question cold-start, and GRPO
+## 7.3 Sub-agent SFT, 40-question cold-start, and GRPO
 
 ```bash
 for KIND in extractor reasoner verifier; do
   CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli train_subagent \
     --base_model "$BASE_MODEL" --teacher_id "$ID" --agent_kind "$KIND" \
     --sft_train_jsonl outputs/sft_data/$ID/${KIND}_sft_final.jsonl \
-    --sft_epochs 4 --sft_lr 5e-5 --sft_bs 1 --sft_grad_accum 8
+    --sft_epochs 4 --sft_lr "$SUBAGENT_SFT_LR" --sft_bs 1 --sft_grad_accum 8
 done
 
 CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli eval_subagents \
@@ -654,7 +689,7 @@ CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli eval_subagents \
 
 # Terminal A:
 conda activate vllm_env
-bash scripts/start_subagent_server.sh "$BASE_MODEL" "$ID" outputs 8000 8192
+bash scripts/start_subagent_server.sh "$BASE_MODEL" "$ID" outputs 8000 32768
 curl -f http://localhost:8000/health
 
 # Terminal B:
@@ -683,7 +718,7 @@ bash scripts/train_manager_grpo_multigpu.sh "$ID" \
   --mgr_output_dir outputs/manager/$ID/grpo_anytime_c05 \
   --mgr_adc_mode --mgr_adc_variant anytime --mgr_adc_cost_per_tool 0.05 \
   --mgr_adc_draft_bonus 0.2 --mgr_adc_missing_draft_penalty 0.1 \
-  --mgr_adc_final_bonus 1.0 --mgr_grpo_beta 0.02 \
+  --mgr_adc_final_bonus 1.0 --mgr_grpo_beta 0.001 \
   --mgr_clip_epsilon_high 0.28 --mgr_max_steps 60 \
   --mgr_use_wandb --wandb_project adc_in_domain \
   --wandb_run_name ${ID}_grpo_c05 --task_description "$DESC"
@@ -692,22 +727,9 @@ bash scripts/train_manager_grpo_multigpu.sh "$ID" \
 ## 7.4 Evaluate all 198 Diamond questions
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $TEST_ARGS \
-  --eval_n_samples 198 --eval_manager_dir base \
-  --task_description "$DESC"
-
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $TEST_ARGS \
-  --eval_n_samples 198 --eval_manager_dir base \
-  --eval_sc_k 5 --eval_sc_temperature 0.7 \
-  --task_description "$DESC"
-
-CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager_tools \
-  --base_model "$BASE_MODEL" --teacher_id "$ID" $TEST_ARGS \
-  --eval_n_samples 198 --eval_manager_dir outputs/manager/$ID/grpo_anytime_c05 \
-  --subagent_server_url http://localhost:8000 \
-  --task_description "$DESC"
+bash scripts/run_eval_budget_suite.sh \
+  "$ID" 198 outputs/manager/$ID/grpo_anytime_c05 \
+  "$BASE_MODEL" "$DESC" $TEST_ARGS
 
 for SEQ in none extractor reasoner verifier \
   extractor,reasoner extractor,verifier reasoner,verifier \
@@ -715,6 +737,7 @@ for SEQ in none extractor reasoner verifier \
   CUDA_VISIBLE_DEVICES=1 python -m src.pipeline.cli eval_manager_forced \
     --base_model "$BASE_MODEL" --teacher_id "$ID" $TEST_ARGS \
     --eval_n_samples 198 --eval_forced_tools "$SEQ" \
+    --eval_max_new_tokens 256 \
     --eval_manager_dir outputs/manager/$ID/grpo_anytime_c05 \
     --subagent_server_url http://localhost:8000 \
     --eval_out_tag "${SEQ//,/_}" --task_description "$DESC"
@@ -730,10 +753,10 @@ runs are still `198 unique questions × 3 runs`, not 594 independent examples.
 
 Run these within each benchmark on exactly the same held-out question IDs:
 
-1. Base Qwen3-8B direct.
+1. Base Qwen3.5-9B direct.
 2. Base + self-consistency with matched token budget.
 3. Direct CoT distillation control using the same DeepSeek token budget.
-4. Forced `none`, each single advisor, each two-advisor subset, and all three.
+4. Forced `none`, each single sub-agent, each two-sub-agent subset, and all three.
 5. Learned ADC policy.
 6. Correctness-cost per-question oracle over the eight forced subsets.
 

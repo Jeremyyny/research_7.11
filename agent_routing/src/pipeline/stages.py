@@ -689,7 +689,7 @@ def run_train_subagent(
     dev_jsonl: Optional[str] = None,
     epochs: int = 3,
     lr: float = 2e-4,
-    max_seq_len: int = 4096,
+    max_seq_len: int = 8192,
     per_device_batch_size: int = 1,
     gradient_accumulation_steps: int = 8,
     use_lora: bool = True,
@@ -734,10 +734,16 @@ def run_train_manager_grpo(
     reasoner_adapter: Optional[str] = None,
     verifier_adapter: Optional[str] = None,
     per_device_batch_size: int = 2,
-    max_completion_length: int = 2048,
+    max_completion_length: int = 1024,
     temperature: float = 0.9,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    min_p: float = 0.0,
+    enable_thinking: bool = False,
     num_generations: int = 6,
-    grpo_beta: float = 0.01,
+    generation_batch_size: int = 0,
+    learning_rate: float = 1e-6,
+    grpo_beta: float = 0.001,
     routing_efficiency_bonus: float = 0.0,
     tool_use_bonus: float = 0.0,
     ccr_mode: bool = False,
@@ -779,7 +785,13 @@ def run_train_manager_grpo(
         per_device_train_batch_size=per_device_batch_size,
         max_completion_length=max_completion_length,
         temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+        enable_thinking=enable_thinking,
         num_generations=num_generations,
+        generation_batch_size=generation_batch_size,
+        learning_rate=learning_rate,
         grpo_beta=grpo_beta,
         max_steps=max_steps,
         routing_efficiency_bonus=routing_efficiency_bonus,
@@ -1035,7 +1047,7 @@ def run_manager_coldstart_sft(
     task_description: str = "",
     epochs: int = 1,
     lr: float = 2e-5,
-    max_seq_len: int = 4096,
+    max_seq_len: int = 8192,
     per_device_batch_size: int = 1,
     gradient_accumulation_steps: int = 8,
     use_lora: bool = True,
@@ -1145,7 +1157,7 @@ def run_train_manager_sft(
     train_jsonl: Optional[str] = None,
     epochs: int = 1,
     lr: float = 2e-5,
-    max_seq_len: int = 4096,
+    max_seq_len: int = 8192,
     per_device_batch_size: int = 1,
     gradient_accumulation_steps: int = 8,
     use_lora: bool = True,
@@ -1333,11 +1345,16 @@ def run_eval_manager(
     manager_dir: Optional[str] = None,
     n_samples: int = 100,
     temperature: float = 0.0,
-    max_new_tokens: int = 1024,
+    max_new_tokens: int = 256,
     task_description: str = "",
     sc_k: int = 1,
     sc_temperature: float = 0.7,
     per_task: int = 0,
+    enable_thinking: bool = False,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    min_p: float = 0.0,
+    out_tag: str = "",
 ) -> Dict[str, Any]:
     """Evaluate manager accuracy + routing pattern on a sample of rows.
 
@@ -1351,7 +1368,8 @@ def run_eval_manager(
     learned orchestrator's delegation budget).
     """
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from ..utils.modeling import load_text_causal_lm
 
     if manager_dir is None:
         manager_dir = (
@@ -1378,12 +1396,12 @@ def run_eval_manager(
         and not os.path.exists(os.path.join(manager_dir, "adapter_config.json"))
     )
     if is_full:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_text_causal_lm(
             model_source, torch_dtype=dtype, trust_remote_code=True
         ).to(device)
     else:
         from peft import PeftModel
-        base = AutoModelForCausalLM.from_pretrained(
+        base = load_text_causal_lm(
             ctx.base_model, torch_dtype=dtype, trust_remote_code=True
         ).to(device)
         model = PeftModel.from_pretrained(base, manager_dir).to(device)
@@ -1396,6 +1414,8 @@ def run_eval_manager(
 
     rows_log: List[Dict[str, Any]] = []
     n_correct = 0
+    total_sample_correct = 0
+    total_sample_generations = 0
     _iter = _tqdm(sample, desc="eval_manager", unit="ex") if _tqdm else sample
     for r in _iter:
         if use_base:
@@ -1422,13 +1442,22 @@ def run_eval_manager(
         ]
         try:
             prompt_text = tok.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
             )
         except TypeError:
+            if enable_thinking:
+                raise RuntimeError(
+                    "Tokenizer does not accept enable_thinking=True; refusing to "
+                    "silently report a thinking baseline."
+                )
             prompt_text = tok.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
             )
         inputs = tok(prompt_text, return_tensors="pt").to(device)
+        prompt_tokens = int(inputs["input_ids"].shape[1])
+        generated_tokens = 0
+        cap_hits = 0
 
         if sc_k > 1:
             votes: List[str] = []
@@ -1437,11 +1466,18 @@ def run_eval_manager(
                 gen = model.generate(
                     **inputs, max_new_tokens=max_new_tokens, do_sample=True,
                     temperature=max(sc_temperature, 1e-6),
+                    top_p=top_p, top_k=top_k, min_p=min_p,
                     pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id,
                 )
-                out = tok.decode(gen[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+                new_ids = gen[0, prompt_tokens:]
+                n_new = int(new_ids.shape[0])
+                generated_tokens += n_new
+                cap_hits += int(n_new >= max_new_tokens)
+                out = tok.decode(new_ids, skip_special_tokens=True).strip()
                 previews.append(out[:200])
                 p = parse_final_answer(out, list(r.choices.keys()))
+                total_sample_generations += 1
+                total_sample_correct += int(p is not None and p == r.ground_truth)
                 if p is not None:
                     votes.append(p)
             if votes:
@@ -1455,10 +1491,20 @@ def run_eval_manager(
             gen = model.generate(
                 **inputs, max_new_tokens=max_new_tokens, do_sample=do_sample,
                 pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id,
-                **({"temperature": max(temperature, 1e-6)} if do_sample else {}),
+                **({
+                    "temperature": max(temperature, 1e-6),
+                    "top_p": top_p,
+                    "top_k": top_k,
+                    "min_p": min_p,
+                } if do_sample else {}),
             )
-            out = tok.decode(gen[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+            new_ids = gen[0, prompt_tokens:]
+            generated_tokens = int(new_ids.shape[0])
+            cap_hits = int(generated_tokens >= max_new_tokens)
+            out = tok.decode(new_ids, skip_special_tokens=True).strip()
             pred = parse_final_answer(out, list(r.choices.keys()))
+            total_sample_generations += 1
+            total_sample_correct += int(pred is not None and pred == r.ground_truth)
 
         correct = bool(pred is not None and pred == r.ground_truth)
         if correct:
@@ -1467,6 +1513,9 @@ def run_eval_manager(
             "example_id": r.example_id, "benchmark_name": r.benchmark_name,
             "task_subtype": r.task_subtype, "ground_truth": r.ground_truth,
             "pred": pred, "correct": correct, "output_preview": out[:600],
+            "prompt_tokens": prompt_tokens,
+            "generated_tokens": generated_tokens,
+            "generation_cap_hits": cap_hits,
         })
         done = len(rows_log)
         if _tqdm and hasattr(_iter, "set_postfix"):
@@ -1475,6 +1524,10 @@ def run_eval_manager(
     accuracy = n_correct / max(1, len(sample))
     suffix = "_base" if use_base else ""
     suffix += f"_sc{sc_k}" if sc_k > 1 else ""
+    if enable_thinking:
+        suffix += "_thinking"
+    if out_tag:
+        suffix += "_" + re.sub(r"[^A-Za-z0-9_.-]+", "_", out_tag)
     by_task: Dict[str, Dict[str, float]] = {}
     for task in sorted({str(r["task_subtype"] or "unknown") for r in rows_log}):
         task_rows = [r for r in rows_log if str(r["task_subtype"] or "unknown") == task]
@@ -1487,6 +1540,16 @@ def run_eval_manager(
         "manager_dir": ("base" if use_base else manager_dir),
         "n_samples": len(sample), "accuracy": accuracy,
         "sc_k": sc_k,
+        "mean_sample_accuracy": total_sample_correct / max(1, total_sample_generations),
+        "enable_thinking": bool(enable_thinking),
+        "max_new_tokens": int(max_new_tokens),
+        "temperature": float(sc_temperature if sc_k > 1 else temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
+        "min_p": float(min_p),
+        "avg_prompt_tokens": sum(r["prompt_tokens"] for r in rows_log) / max(1, len(rows_log)),
+        "avg_generated_tokens": sum(r["generated_tokens"] for r in rows_log) / max(1, len(rows_log)),
+        "generation_cap_hit_rate": sum(r["generation_cap_hits"] for r in rows_log) / max(1, total_sample_generations),
         "by_task": by_task,
         "macro_task_accuracy": (
             sum(v["accuracy"] for v in by_task.values()) / max(1, len(by_task))
@@ -1588,7 +1651,8 @@ def _tool_call_message(
 
 def _load_manager_for_eval(ctx: StageContext, manager_dir: str, device: str, dtype: Any):
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from ..utils.modeling import load_text_causal_lm
 
     tok = AutoTokenizer.from_pretrained(manager_dir, trust_remote_code=True)
     if tok.pad_token_id is None and tok.eos_token_id is not None:
@@ -1600,12 +1664,12 @@ def _load_manager_for_eval(ctx: StageContext, manager_dir: str, device: str, dty
         and not os.path.exists(os.path.join(manager_dir, "adapter_config.json"))
     )
     if is_full:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_text_causal_lm(
             manager_dir, torch_dtype=dtype, trust_remote_code=True
         ).to(device)
     else:
         from peft import PeftModel
-        base = AutoModelForCausalLM.from_pretrained(
+        base = load_text_causal_lm(
             ctx.base_model, torch_dtype=dtype, trust_remote_code=True
         ).to(device)
         model = PeftModel.from_pretrained(base, manager_dir).to(device)
@@ -1614,22 +1678,123 @@ def _load_manager_for_eval(ctx: StageContext, manager_dir: str, device: str, dty
 
 
 def _render_manager_chat(tok: Any, messages: List[Dict[str, Any]],
-                         tools: List[Dict[str, Any]]) -> str:
+                         tools: List[Dict[str, Any]],
+                         enable_thinking: bool = False) -> str:
     try:
         return tok.apply_chat_template(
             messages,
             tools=tools,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=enable_thinking,
         )
     except TypeError:
+        if enable_thinking:
+            raise RuntimeError(
+                "Tokenizer does not accept enable_thinking=True; refusing to "
+                "silently report a thinking evaluation."
+            )
         return tok.apply_chat_template(
             messages,
             tools=tools,
             tokenize=False,
             add_generation_prompt=True,
         )
+
+
+def _new_subagent_token_usage() -> Dict[str, Dict[str, int]]:
+    return {
+        kind: {
+            "calls": 0,
+            "cache_hits": 0,
+            "generation_cap_hits": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        for kind in ("extractor", "reasoner", "verifier")
+    }
+
+
+def _record_subagent_token_usage(
+    pool: Any,
+    usage_by_kind: Dict[str, Dict[str, int]],
+    kind: str,
+    fallback_completion_tokens: int = 0,
+) -> None:
+    """Consume one pool call-log event and aggregate its actual inference usage."""
+    events = pool.drain_log() if hasattr(pool, "drain_log") else []
+    event = events[-1] if events else {}
+    prompt_tokens = int(event.get("prompt_tokens") or 0)
+    completion_tokens = int(event.get("completion_tokens") or 0)
+    if not event.get("cache_hit") and completion_tokens <= 0:
+        completion_tokens = int(fallback_completion_tokens)
+    total_tokens = int(event.get("total_tokens") or (prompt_tokens + completion_tokens))
+    bucket = usage_by_kind.setdefault(kind, {
+        "calls": 0,
+        "cache_hits": 0,
+        "generation_cap_hits": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    })
+    bucket["calls"] += 1
+    bucket["cache_hits"] += int(bool(event.get("cache_hit")))
+    cap = int(event.get("max_new_tokens") or 0)
+    cap_hit = bool(event.get("generation_cap_hit")) or (
+        not event.get("cache_hit") and cap > 0 and completion_tokens >= cap
+    )
+    bucket["generation_cap_hits"] += int(cap_hit)
+    bucket["prompt_tokens"] += prompt_tokens
+    bucket["completion_tokens"] += completion_tokens
+    bucket["total_tokens"] += total_tokens
+
+
+def _sum_subagent_usage(
+    usage_by_kind: Dict[str, Dict[str, int]], key: str
+) -> int:
+    return sum(int(values.get(key, 0)) for values in usage_by_kind.values())
+
+
+def _aggregate_subagent_usage(rows_log: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    aggregate = _new_subagent_token_usage()
+    for row in rows_log:
+        for kind, values in row.get("subagent_tokens_by_kind", {}).items():
+            bucket = aggregate.setdefault(kind, {})
+            for key in (
+                "calls", "cache_hits", "generation_cap_hits",
+                "prompt_tokens", "completion_tokens", "total_tokens",
+            ):
+                bucket[key] = int(bucket.get(key, 0)) + int(values.get(key, 0))
+    return aggregate
+
+
+def _usage_by_tool_call_count(rows_log: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    """Summarize the actual accuracy/compute curve induced by adaptive stopping."""
+    result: Dict[str, Dict[str, float]] = {}
+    for k in sorted({int(row.get("tool_calls", 0)) for row in rows_log}):
+        group = [row for row in rows_log if int(row.get("tool_calls", 0)) == k]
+        n = len(group)
+        result[str(k)] = {
+            "n": n,
+            "accuracy": sum(bool(row.get("correct")) for row in group) / max(1, n),
+            "avg_manager_completion_tokens": sum(
+                int(row.get("manager_completion_tokens", 0)) for row in group
+            ) / max(1, n),
+            "avg_subagent_completion_tokens": sum(
+                int(row.get("subagent_completion_tokens", 0)) for row in group
+            ) / max(1, n),
+            "avg_mas_prompt_tokens": sum(
+                int(row.get("mas_prompt_tokens", 0)) for row in group
+            ) / max(1, n),
+            "avg_mas_completion_tokens": sum(
+                int(row.get("mas_completion_tokens", 0)) for row in group
+            ) / max(1, n),
+            "avg_mas_total_tokens": sum(
+                int(row.get("mas_total_tokens", 0)) for row in group
+            ) / max(1, n),
+        }
+    return result
 
 
 def run_eval_manager_tools(
@@ -1638,15 +1803,26 @@ def run_eval_manager_tools(
     manager_dir: Optional[str] = None,
     n_samples: int = 100,
     temperature: float = 0.0,
-    max_new_tokens: int = 1024,
+    max_new_tokens: int = 256,
     max_tool_calls: int = 3,
+    max_total_manager_tokens: int = 0,
     task_description: str = "",
     per_task: int = 0,
     subagent_server_url: str = "",
+    enable_thinking: bool = False,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    min_p: float = 0.0,
+    out_tag: str = "",
 ) -> Dict[str, Any]:
     """Evaluate the manager with the same frozen subagents used as tools."""
     import torch
-    from ..subagents.runtime import FrozenSubagent, RemoteSubagentPool, SubagentPool
+    from ..subagents.runtime import (
+        FrozenSubagent,
+        RemoteSubagentPool,
+        SubagentPool,
+        default_subagent_max_new_tokens,
+    )
 
     if manager_dir is None:
         manager_dir = ctx.manager_grpo_dir()
@@ -1733,20 +1909,48 @@ def run_eval_manager_tools(
         trajectory: List[Dict[str, Any]] = []
         used_tools: List[str] = []
         final_text = ""
+        manager_prompt_tokens = 0
+        manager_completion_tokens = 0
+        subagent_usage_by_kind = _new_subagent_token_usage()
+        generation_cap_hits = 0
+        manager_turns = 0
+        total_budget_exhausted = False
 
         for step in range(max(1, max_tool_calls + 1)):
-            prompt_text = _render_manager_chat(tok, messages, tools)
+            remaining = (
+                max_total_manager_tokens - manager_completion_tokens
+                if max_total_manager_tokens > 0 else max_new_tokens
+            )
+            if remaining <= 0:
+                total_budget_exhausted = True
+                break
+            turn_max_new_tokens = min(max_new_tokens, remaining)
+            manager_turns += 1
+            prompt_text = _render_manager_chat(
+                tok, messages, tools, enable_thinking=enable_thinking
+            )
             inputs = tok(prompt_text, return_tensors="pt").to(device)
+            prompt_tokens = int(inputs["input_ids"].shape[1])
+            manager_prompt_tokens += prompt_tokens
             do_sample = temperature > 1e-6
             gen = model.generate(
                 **inputs,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=turn_max_new_tokens,
                 do_sample=do_sample,
                 pad_token_id=tok.pad_token_id,
                 eos_token_id=tok.eos_token_id,
-                **({"temperature": max(temperature, 1e-6)} if do_sample else {}),
+                **({
+                    "temperature": max(temperature, 1e-6),
+                    "top_p": top_p,
+                    "top_k": top_k,
+                    "min_p": min_p,
+                } if do_sample else {}),
             )
-            out = tok.decode(gen[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+            new_ids = gen[0, prompt_tokens:]
+            n_new = int(new_ids.shape[0])
+            manager_completion_tokens += n_new
+            generation_cap_hits += int(n_new >= turn_max_new_tokens)
+            out = tok.decode(new_ids, skip_special_tokens=True).strip()
             content, calls = _extract_manager_tool_calls(out)
             final_text = content or out
 
@@ -1781,6 +1985,13 @@ def run_eval_manager_tools(
             except Exception as e:
                 malformed_tool_calls += 1
                 tool_output = json.dumps({"error": str(e)}, ensure_ascii=False)
+            fallback_completion_tokens = len(tok.encode(tool_output, add_special_tokens=False))
+            _record_subagent_token_usage(
+                pool,
+                subagent_usage_by_kind,
+                tool_kind,
+                fallback_completion_tokens=fallback_completion_tokens,
+            )
 
             messages.append({
                 "role": "tool",
@@ -1813,6 +2024,10 @@ def run_eval_manager_tools(
                 tools=f"{total_tool_calls/done2:.1f}",
                 n=done2,
             )
+        subagent_prompt_tokens = _sum_subagent_usage(subagent_usage_by_kind, "prompt_tokens")
+        subagent_completion_tokens = _sum_subagent_usage(subagent_usage_by_kind, "completion_tokens")
+        subagent_total_tokens = _sum_subagent_usage(subagent_usage_by_kind, "total_tokens")
+        manager_total_tokens = manager_prompt_tokens + manager_completion_tokens
         rows_log.append({
             "example_id": r.example_id,
             "benchmark_name": r.benchmark_name,
@@ -1824,6 +2039,19 @@ def run_eval_manager_tools(
             "tool_calls": len(used_tools),
             "tool_names_called": used_tools,
             "final_text": final_text[:2000],
+            "manager_prompt_tokens": manager_prompt_tokens,
+            "manager_completion_tokens": manager_completion_tokens,
+            "manager_total_tokens": manager_total_tokens,
+            "subagent_tokens_by_kind": subagent_usage_by_kind,
+            "subagent_prompt_tokens": subagent_prompt_tokens,
+            "subagent_completion_tokens": subagent_completion_tokens,
+            "subagent_total_tokens": subagent_total_tokens,
+            "mas_prompt_tokens": manager_prompt_tokens + subagent_prompt_tokens,
+            "mas_completion_tokens": manager_completion_tokens + subagent_completion_tokens,
+            "mas_total_tokens": manager_total_tokens + subagent_total_tokens,
+            "generation_cap_hits": generation_cap_hits,
+            "manager_turns": manager_turns,
+            "total_budget_exhausted": total_budget_exhausted,
             "trajectory": trajectory,
         })
 
@@ -1836,6 +2064,21 @@ def run_eval_manager_tools(
             "accuracy": sum(r["correct"] for r in task_rows) / max(1, len(task_rows)),
             "avg_tool_calls": sum(r["tool_calls"] for r in task_rows) / max(1, len(task_rows)),
         }
+    manager_cap_hit_rate = sum(
+        r["generation_cap_hits"] for r in rows_log
+    ) / max(1, sum(r["manager_turns"] for r in rows_log))
+    total_budget_exhaustion_rate = sum(
+        r["total_budget_exhausted"] for r in rows_log
+    ) / max(1, n)
+    budget_ok = manager_cap_hit_rate < 0.02 and total_budget_exhaustion_rate < 0.02
+    usage_by_tool_call_count = _usage_by_tool_call_count(rows_log)
+    ordered_usage = [
+        usage_by_tool_call_count[key]["avg_mas_total_tokens"]
+        for key in sorted(usage_by_tool_call_count, key=int)
+    ]
+    mean_tokens_non_decreasing_with_calls = all(
+        right >= left for left, right in zip(ordered_usage, ordered_usage[1:])
+    )
     report = {
         "teacher_id": ctx.teacher_id,
         "manager_dir": manager_dir,
@@ -1848,14 +2091,51 @@ def run_eval_manager_tools(
         "malformed_tool_calls": malformed_tool_calls,
         "binding_mode": binding_mode,
         "subagents": sorted(available_kinds),
+        "subagent_max_new_tokens": {
+            kind: default_subagent_max_new_tokens(kind)
+            for kind in sorted(available_kinds)
+        },
+        "subagent_tokens_by_kind": _aggregate_subagent_usage(rows_log),
         "subagent_server_url": subagent_server_url,
+        "enable_thinking": bool(enable_thinking),
+        "max_new_tokens_per_manager_turn": int(max_new_tokens),
+        "max_manager_turns": int(max_tool_calls + 1),
+        "max_total_manager_tokens": int(max_total_manager_tokens),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
+        "min_p": float(min_p),
+        "avg_manager_prompt_tokens": sum(r["manager_prompt_tokens"] for r in rows_log) / max(1, n),
+        "avg_manager_completion_tokens": sum(r["manager_completion_tokens"] for r in rows_log) / max(1, n),
+        "avg_manager_total_tokens": sum(r["manager_total_tokens"] for r in rows_log) / max(1, n),
+        "avg_subagent_prompt_tokens": sum(r["subagent_prompt_tokens"] for r in rows_log) / max(1, n),
+        "avg_subagent_completion_tokens": sum(r["subagent_completion_tokens"] for r in rows_log) / max(1, n),
+        "avg_subagent_total_tokens": sum(r["subagent_total_tokens"] for r in rows_log) / max(1, n),
+        "avg_mas_prompt_tokens": sum(r["mas_prompt_tokens"] for r in rows_log) / max(1, n),
+        "avg_mas_completion_tokens": sum(r["mas_completion_tokens"] for r in rows_log) / max(1, n),
+        "avg_mas_total_tokens": sum(r["mas_total_tokens"] for r in rows_log) / max(1, n),
+        "manager_generation_cap_hits": sum(r["generation_cap_hits"] for r in rows_log),
+        "manager_generation_cap_hit_rate": manager_cap_hit_rate,
+        "total_budget_exhaustion_rate": total_budget_exhaustion_rate,
+        "usage_by_tool_call_count": usage_by_tool_call_count,
+        "mean_tokens_non_decreasing_with_calls": mean_tokens_non_decreasing_with_calls,
+        "manager_budget_diagnostic": {
+            "threshold": 0.02,
+            "budget_ok": budget_ok,
+            "recommendation": (
+                "keep_or_reduce_budget"
+                if budget_ok else "inspect_truncation_before_increasing_budget"
+            ),
+        },
         "by_task": by_task,
         "macro_task_accuracy": (
             sum(v["accuracy"] for v in by_task.values()) / max(1, len(by_task))
         ),
     }
-    write_jsonl(os.path.join(ctx.eval_root, "manager_tool_eval.jsonl"), rows_log)
-    write_json(os.path.join(ctx.eval_root, "manager_tool_eval_report.json"), report)
+    safe_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", out_tag) if out_tag else ""
+    stem = "manager_tool_eval" + (f"_{safe_tag}" if safe_tag else "")
+    write_jsonl(os.path.join(ctx.eval_root, f"{stem}.jsonl"), rows_log)
+    write_json(os.path.join(ctx.eval_root, f"{stem}_report.json"), report)
     print(
         f"[EVAL/MANAGER_TOOLS] teacher={ctx.teacher_id} "
         f"acc={report['accuracy']:.3f} tool_rate={report['tool_call_rate']:.3f} (n={n})"
@@ -1870,19 +2150,23 @@ def run_eval_manager_forced(
     forced_tools: Optional[List[str]] = None,
     n_samples: int = 100,
     temperature: float = 0.0,
-    max_new_tokens: int = 1024,
+    max_new_tokens: int = 256,
     task_description: str = "",
     out_tag: str = "",
     per_task: int = 0,
     subagent_server_url: str = "",
+    enable_thinking: bool = False,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    min_p: float = 0.0,
 ) -> Dict[str, Any]:
     """Evaluate the manager under a FIXED delegation sequence (no free choice).
 
-    For each forced advisor, the assistant tool-call turn and the frozen
-    advisor's output are injected into the history (mirroring cold-start SFT
+    For each forced sub-agent, the assistant tool-call turn and the frozen
+    sub-agent output are injected into the history (mirroring cold-start SFT
     construction); the manager generates only the final answer turn.
 
-    Running this once per advisor subset yields (a) the fixed-k baselines for
+    Running this once per sub-agent subset yields (a) the fixed-k baselines for
     the RQ1 main table and the RQ2 Pareto plot, and (b) the per-question
     inputs for the stopping oracle: oracle reward = max over subsets of
     (correct - cost * k), computed offline from the saved jsonl files.
@@ -1892,7 +2176,12 @@ def run_eval_manager_forced(
     would leak).
     """
     import torch
-    from ..subagents.runtime import FrozenSubagent, RemoteSubagentPool, SubagentPool
+    from ..subagents.runtime import (
+        FrozenSubagent,
+        RemoteSubagentPool,
+        SubagentPool,
+        default_subagent_max_new_tokens,
+    )
 
     forced = [t.strip() for t in (forced_tools or []) if t.strip() and t.strip() != "none"]
     valid_kinds = {"extractor", "reasoner", "verifier"}
@@ -1952,6 +2241,7 @@ def run_eval_manager_forced(
     n_valid = 0
     _iter3 = _tqdm3(sample, desc=f"eval_forced[{','.join(forced) or 'none'}]", unit="ex") if _tqdm3 else sample
     for r in _iter3:
+        subagent_usage_by_kind = _new_subagent_token_usage()
         messages: List[Dict[str, Any]] = [
             {
                 "role": "system",
@@ -1986,6 +2276,13 @@ def run_eval_manager_forced(
                 choices=r.choices,
                 cache_namespace="eval_forced",
             )
+            fallback_completion_tokens = len(tok.encode(tool_output, add_special_tokens=False))
+            _record_subagent_token_usage(
+                pool,
+                subagent_usage_by_kind,
+                kind,
+                fallback_completion_tokens=fallback_completion_tokens,
+            )
             messages.append({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -1993,8 +2290,11 @@ def run_eval_manager_forced(
                 "content": tool_output,
             })
 
-        prompt_text = _render_manager_chat(tok, messages, tools)
+        prompt_text = _render_manager_chat(
+            tok, messages, tools, enable_thinking=enable_thinking
+        )
         inputs = tok(prompt_text, return_tensors="pt").to(device)
+        prompt_tokens = int(inputs["input_ids"].shape[1])
         do_sample = temperature > 1e-6
         gen = model.generate(
             **inputs,
@@ -2002,9 +2302,16 @@ def run_eval_manager_forced(
             do_sample=do_sample,
             pad_token_id=tok.pad_token_id,
             eos_token_id=tok.eos_token_id,
-            **({"temperature": max(temperature, 1e-6)} if do_sample else {}),
+            **({
+                "temperature": max(temperature, 1e-6),
+                "top_p": top_p,
+                "top_k": top_k,
+                "min_p": min_p,
+            } if do_sample else {}),
         )
-        out = tok.decode(gen[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        new_ids = gen[0, prompt_tokens:]
+        manager_completion_tokens = int(new_ids.shape[0])
+        out = tok.decode(new_ids, skip_special_tokens=True).strip()
         content, _extra_calls = _extract_manager_tool_calls(out)
         final_text = content or out
         pred = parse_final_answer(final_text, list(r.choices.keys()))
@@ -2013,6 +2320,10 @@ def run_eval_manager_forced(
             n_valid += 1
         if correct:
             n_correct += 1
+        subagent_prompt_tokens = _sum_subagent_usage(subagent_usage_by_kind, "prompt_tokens")
+        subagent_completion_tokens = _sum_subagent_usage(subagent_usage_by_kind, "completion_tokens")
+        subagent_total_tokens = _sum_subagent_usage(subagent_usage_by_kind, "total_tokens")
+        manager_total_tokens = prompt_tokens + manager_completion_tokens
         rows_log.append({
             "example_id": r.example_id,
             "benchmark_name": r.benchmark_name,
@@ -2024,6 +2335,17 @@ def run_eval_manager_forced(
             "tool_calls": len(forced),
             "forced_tools": list(forced),
             "final_text": final_text[:1200],
+            "manager_prompt_tokens": prompt_tokens,
+            "manager_completion_tokens": manager_completion_tokens,
+            "manager_total_tokens": manager_total_tokens,
+            "subagent_tokens_by_kind": subagent_usage_by_kind,
+            "subagent_prompt_tokens": subagent_prompt_tokens,
+            "subagent_completion_tokens": subagent_completion_tokens,
+            "subagent_total_tokens": subagent_total_tokens,
+            "mas_prompt_tokens": prompt_tokens + subagent_prompt_tokens,
+            "mas_completion_tokens": manager_completion_tokens + subagent_completion_tokens,
+            "mas_total_tokens": manager_total_tokens + subagent_total_tokens,
+            "generation_cap_hit": bool(manager_completion_tokens >= max_new_tokens),
         })
 
     n = len(sample)
@@ -2039,6 +2361,27 @@ def run_eval_manager_forced(
         "valid_answer_rate": n_valid / max(1, n),
         "binding_mode": binding_mode,
         "subagent_server_url": subagent_server_url,
+        "subagent_tokens_by_kind": _aggregate_subagent_usage(rows_log),
+        "subagent_max_new_tokens": {
+            kind: default_subagent_max_new_tokens(kind)
+            for kind in sorted({*forced})
+        },
+        "enable_thinking": bool(enable_thinking),
+        "max_new_tokens": int(max_new_tokens),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
+        "min_p": float(min_p),
+        "avg_manager_prompt_tokens": sum(r["manager_prompt_tokens"] for r in rows_log) / max(1, n),
+        "avg_manager_completion_tokens": sum(r["manager_completion_tokens"] for r in rows_log) / max(1, n),
+        "avg_manager_total_tokens": sum(r["manager_total_tokens"] for r in rows_log) / max(1, n),
+        "avg_subagent_prompt_tokens": sum(r["subagent_prompt_tokens"] for r in rows_log) / max(1, n),
+        "avg_subagent_completion_tokens": sum(r["subagent_completion_tokens"] for r in rows_log) / max(1, n),
+        "avg_subagent_total_tokens": sum(r["subagent_total_tokens"] for r in rows_log) / max(1, n),
+        "avg_mas_prompt_tokens": sum(r["mas_prompt_tokens"] for r in rows_log) / max(1, n),
+        "avg_mas_completion_tokens": sum(r["mas_completion_tokens"] for r in rows_log) / max(1, n),
+        "avg_mas_total_tokens": sum(r["mas_total_tokens"] for r in rows_log) / max(1, n),
+        "generation_cap_hit_rate": sum(r["generation_cap_hit"] for r in rows_log) / max(1, n),
     }
     write_jsonl(os.path.join(ctx.eval_root, f"manager_forced_{safe_tag}.jsonl"), rows_log)
     write_json(os.path.join(ctx.eval_root, f"manager_forced_{safe_tag}_report.json"), report)

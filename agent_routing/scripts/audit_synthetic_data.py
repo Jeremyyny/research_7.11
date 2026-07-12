@@ -1,4 +1,4 @@
-"""Audit advisor synthetic JSONL before any SFT run."""
+"""Audit sub-agent synthetic JSONL before any SFT run."""
 from __future__ import annotations
 
 import argparse

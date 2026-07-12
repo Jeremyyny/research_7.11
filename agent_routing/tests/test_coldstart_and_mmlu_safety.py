@@ -90,10 +90,63 @@ class ColdStartSafetyTest(unittest.TestCase):
         self.assertIn('"macro_task_accuracy"', src)
         self.assertIn('suffix = "_base" if use_base else ""', src)
 
-    def test_tool_evaluation_can_reuse_remote_advisors(self):
+    def test_tool_evaluation_can_reuse_remote_subagents(self):
         src = (ROOT / "src" / "pipeline" / "stages.py").read_text(encoding="utf-8")
         self.assertIn("RemoteSubagentPool", src)
         self.assertIn('"subagent_server_url": subagent_server_url', src)
+
+    def test_thinking_and_token_budgets_are_explicit(self):
+        cli = (ROOT / "src" / "pipeline" / "cli.py").read_text(encoding="utf-8")
+        stages = (ROOT / "src" / "pipeline" / "stages.py").read_text(encoding="utf-8")
+        grpo = (ROOT / "src" / "manager" / "grpo_train.py").read_text(encoding="utf-8")
+        suite = (ROOT / "scripts" / "run_eval_budget_suite.sh").read_text(encoding="utf-8")
+        self.assertIn("--eval_enable_thinking", cli)
+        self.assertIn("--eval_max_total_manager_tokens", cli)
+        self.assertIn('chat_template_kwargs={"enable_thinking": bool(cfg.enable_thinking)}', grpo)
+        self.assertIn('"mean_sample_accuracy"', stages)
+        self.assertIn('"generation_cap_hit_rate"', stages)
+        self.assertNotIn("--eval_enable_thinking", suite)
+        self.assertNotIn("--eval_sc_k", suite)
+        self.assertIn("--eval_max_new_tokens 256", suite)
+        self.assertIn("--eval_max_total_manager_tokens 1024", suite)
+
+    def test_manager_is_strict_router_and_role_budgets_are_explicit(self):
+        prompt = (ROOT / "src" / "manager" / "prompt.py").read_text(encoding="utf-8")
+        runtime = (ROOT / "src" / "subagents" / "runtime.py").read_text(encoding="utf-8")
+        self.assertIn("Do not provide free-form reasoning", prompt)
+        self.assertNotIn("Brief reasoning above", prompt)
+        self.assertIn('"extractor": 512', runtime)
+        self.assertIn('"reasoner": 1024', runtime)
+        self.assertIn('"verifier": 768', runtime)
+
+    def test_qwen35_text_loading_and_lora_targets_are_explicit(self):
+        modeling = (ROOT / "src" / "utils" / "modeling.py").read_text(encoding="utf-8")
+        server = (ROOT / "scripts" / "start_subagent_server.sh").read_text(encoding="utf-8")
+        grpo = (ROOT / "src" / "manager" / "grpo_train.py").read_text(encoding="utf-8")
+        self.assertIn("Qwen3_5ForCausalLM", modeling)
+        for module in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"):
+            self.assertIn(f'"{module}"', modeling)
+        self.assertIn("--language-model-only", server)
+        self.assertIn("--reasoning-parser qwen3", server)
+        self.assertIn("top_p=float(cfg.top_p)", grpo)
+        self.assertIn("top_k=int(cfg.top_k)", grpo)
+        self.assertIn("min_p=float(cfg.min_p)", grpo)
+        self.assertIn('"generation_batch_size"', grpo)
+
+    def test_mas_evaluation_records_full_token_usage(self):
+        stages = (ROOT / "src" / "pipeline" / "stages.py").read_text(encoding="utf-8")
+        runtime = (ROOT / "src" / "subagents" / "runtime.py").read_text(encoding="utf-8")
+        for field in (
+            "manager_prompt_tokens",
+            "manager_completion_tokens",
+            "subagent_prompt_tokens",
+            "subagent_completion_tokens",
+            "subagent_tokens_by_kind",
+            "mas_total_tokens",
+        ):
+            self.assertIn(f'"{field}"', stages)
+        self.assertIn('body.get("usage")', runtime)
+        self.assertNotIn("ad" + "visor", stages.lower())
 
 
 if __name__ == "__main__":

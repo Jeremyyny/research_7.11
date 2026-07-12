@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from datasets import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 try:
     from peft import PeftModel
@@ -43,8 +43,14 @@ except Exception:
     HAS_RESP_SCHEMA = False
 
 from ..benchmarks.base import StandardRow
-from ..subagents.runtime import FrozenSubagent, RemoteSubagentPool, SubagentPool
+from ..subagents.runtime import (
+    FrozenSubagent,
+    RemoteSubagentPool,
+    SubagentPool,
+    default_subagent_max_new_tokens,
+)
 from ..utils.io import write_json
+from ..utils.modeling import load_text_causal_lm
 from ..utils.seed import set_seed
 from .prompt import build_manager_system_prompt, build_manager_user_message
 from .reward import build_reward_funcs
@@ -222,10 +228,16 @@ class ManagerGRPOConfig:
     raw_trace_jsonl: Optional[str] = None
     seed: int = 42
     per_device_train_batch_size: int = 2
-    max_completion_length: int = 2048
+    max_completion_length: int = 1024
     temperature: float = 0.9
+    top_p: float = 0.95
+    top_k: int = 20
+    min_p: float = 0.0
+    enable_thinking: bool = False
     num_generations: int = 6
-    grpo_beta: float = 0.01
+    generation_batch_size: int = 0
+    learning_rate: float = 1e-6
+    grpo_beta: float = 0.001
     max_steps: int = -1
     routing_efficiency_bonus: float = 0.0
     tool_use_bonus: float = 0.0
@@ -388,12 +400,12 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         and not os.path.exists(os.path.join(cfg.manager_adapter, "adapter_config.json"))
     )
     if cfg.full_parameter_rl and is_full_init:
-        manager_model = AutoModelForCausalLM.from_pretrained(
+        manager_model = load_text_causal_lm(
             cfg.manager_adapter, torch_dtype=dtype, trust_remote_code=True
         ).to(device)
         print(f"[MANAGER_GRPO] full-parameter init model -> {cfg.manager_adapter}")
     else:
-        manager_model = AutoModelForCausalLM.from_pretrained(
+        manager_model = load_text_causal_lm(
             cfg.base_model, torch_dtype=dtype, trust_remote_code=True
         ).to(device)
         if cfg.manager_adapter:
@@ -426,12 +438,28 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         # Allows larger updates when increasing probability of under-explored actions
         # without symmetrically loosening the lower bound that guards against collapse.
         _grpo_extra["epsilon_high"] = float(cfg.clip_epsilon_high)
+    if cfg.generation_batch_size > 0:
+        if "generation_batch_size" not in inspect.signature(GRPOConfig.__init__).parameters:
+            raise RuntimeError(
+                "The installed TRL does not support generation_batch_size. "
+                "Upgrade TRL before using --mgr_generation_batch_size."
+            )
+        if cfg.generation_batch_size % cfg.num_generations != 0:
+            raise ValueError(
+                "generation_batch_size must be divisible by num_generations; "
+                f"got {cfg.generation_batch_size} and {cfg.num_generations}."
+            )
+        _grpo_extra["generation_batch_size"] = int(cfg.generation_batch_size)
     grpo_args = GRPOConfig(
         output_dir=cfg.out_dir,
         remove_unused_columns=False,
         max_completion_length=int(cfg.max_completion_length),
         temperature=float(cfg.temperature),
+        top_p=float(cfg.top_p),
+        top_k=int(cfg.top_k),
+        min_p=float(cfg.min_p),
         num_generations=int(cfg.num_generations),
+        learning_rate=float(cfg.learning_rate),
         bf16=(device == "cuda"),
         beta=float(cfg.grpo_beta),
         scale_rewards="group",
@@ -439,7 +467,7 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         use_vllm=False,
         per_device_train_batch_size=int(cfg.per_device_train_batch_size),
         max_tool_calling_iterations=3,           # we allow up to 3 tools
-        chat_template_kwargs={"enable_thinking": False},
+        chat_template_kwargs={"enable_thinking": bool(cfg.enable_thinking)},
         logging_steps=1,
         log_completions=True,
         num_completions_to_print=None,
@@ -525,8 +553,19 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         "binding_mode": binding_mode,
         "n_train_rows": len(cfg.rows),
         "subagents": subagent_keys,
+        "subagent_max_new_tokens": {
+            kind: default_subagent_max_new_tokens(kind) for kind in subagent_keys
+        },
         "manager_adapter": cfg.manager_adapter,
         "full_parameter_rl": bool(cfg.full_parameter_rl),
+        "enable_thinking": bool(cfg.enable_thinking),
+        "max_completion_length": int(cfg.max_completion_length),
+        "temperature": float(cfg.temperature),
+        "top_p": float(cfg.top_p),
+        "top_k": int(cfg.top_k),
+        "min_p": float(cfg.min_p),
+        "learning_rate": float(cfg.learning_rate),
+        "generation_batch_size": int(cfg.generation_batch_size),
         "subagent_server_url": cfg.subagent_server_url or "",
         "routing_efficiency_bonus": cfg.routing_efficiency_bonus,
         "tool_use_bonus": cfg.tool_use_bonus,

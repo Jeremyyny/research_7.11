@@ -22,12 +22,13 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from datasets import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Trainer, TrainingArguments
+from transformers import AutoTokenizer, DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
 from ..benchmarks.base import StandardRow, question_hash as _question_hash
 from ..subagents.runtime import FrozenSubagent, RemoteSubagentPool, SubagentPool
 from ..teachers.base import TeacherClient
 from ..utils.io import read_jsonl, write_jsonl, write_json
+from ..utils.modeling import discover_lora_target_modules, load_text_causal_lm
 from ..utils.seed import set_seed
 
 try:
@@ -183,8 +184,8 @@ def _draft_answer_str(gt: str) -> str:
 class _RemoteManagerDraftGenerator:
     """Elicit state-dependent manager beliefs from the shared vLLM server.
 
-    The subagent server exposes the base model as ``base`` alongside the three
-    LoRA advisors.  This lets cold-start alternate manager -> advisor -> manager
+    The sub-agent server exposes the base model as ``base`` alongside the three
+    LoRA sub-agents. This lets cold-start alternate manager -> sub-agent -> manager
     without loading four separate 8B model copies in one Python process.
     """
 
@@ -262,7 +263,7 @@ def _predict_base_initial_drafts(
     Cold-start previously copied ``row.ground_truth`` into every draft.  That
     produced oracle belief trajectories and made the verifier see only correct
     candidates.  This pass deliberately runs *before* subagents are loaded, so
-    an 8B setup does not need the base manager and three advisor models resident
+    an 8B setup does not need the base manager and three sub-agent models resident
     at the same time.
 
     Only parseable on-policy predictions are returned.  We never fall back to
@@ -278,7 +279,7 @@ def _predict_base_initial_drafts(
     tok = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token_id = tok.eos_token_id
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_text_causal_lm(
         base_model, torch_dtype=dtype, trust_remote_code=True
     ).to(device)
     model.eval()
@@ -319,7 +320,7 @@ def _predict_base_initial_drafts(
         if pred is not None:
             predictions[int(row.example_id)] = pred
 
-    # Release the base model before the three frozen advisors are loaded.
+    # Release the base model before the three frozen sub-agents are loaded.
     del model
     del tok
     if torch.cuda.is_available():
@@ -499,7 +500,7 @@ def _build_manager_tool_sft_rows(
 
         history = list(base_messages)
         # Belief states, not tool turns: initial belief followed by one
-        # post-advisor belief per executed tool.  Keeping the final update is
+        # post-sub-agent belief per executed tool. Keeping the final update is
         # essential for measuring whether a one-tool trajectory corrected or
         # corrupted the manager's answer.
         draft_sequence: List[str] = [draft_answer]
@@ -684,7 +685,7 @@ def build_manager_sft_from_rows(
     if cfg.n_samples > 0:
         sample = sample[:cfg.n_samples]
 
-    # Elicit beliefs before loading advisors to avoid keeping four model copies
+    # Elicit beliefs before loading sub-agents to avoid keeping four model copies
     # resident at once.  Oracle drafts remain available only as an explicit
     # ablation via draft_source="oracle".
     draft_answers = _coldstart_draft_map(cfg, sample)
@@ -793,11 +794,11 @@ def make_cost_aware_sequences(
     cfg: ColdStartSFTConfig,
     rows: List[StandardRow],
 ) -> Dict[int, List[str]]:
-    """Enumerate advisor subsets and imitate the best correctness-cost action.
+    """Enumerate sub-agent subsets and imitate the best correctness-cost action.
 
     Ground truth selects the expert action sequence, but is never inserted into
     a draft. Every simulated draft is elicited from the base manager after the
-    actual advisor output, making the supervision appropriate for stopping.
+    actual sub-agent output, making the supervision appropriate for stopping.
     """
     generator = _build_remote_draft_generator(cfg)
     if generator is None:
@@ -912,7 +913,7 @@ class ManagerSFTConfig:
     train_jsonl: str
     out_dir: str
     seed: int = 42
-    max_seq_len: int = 4096
+    max_seq_len: int = 8192
     learning_rate: float = 2e-5
     num_train_epochs: int = 1
     per_device_batch_size: int = 1
@@ -977,15 +978,13 @@ def train_manager_sft(cfg: ManagerSFTConfig) -> None:
         tok.pad_token_id = tok.eos_token_id
 
     dtype = torch.bfloat16 if (cfg.bf16 and device == "cuda") else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_text_causal_lm(
         cfg.base_model, torch_dtype=dtype, trust_remote_code=True
     ).to(device)
     model.config.use_cache = False
 
     if cfg.use_lora and PEFT_AVAILABLE:
-        candidate = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        present = {n.split(".")[-1] for n, _ in model.named_modules()}
-        target = [m for m in candidate if m in present] or ["q_proj", "v_proj"]
+        target = discover_lora_target_modules(model)
         lconf = LoraConfig(
             r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
             bias="none", task_type="CAUSAL_LM", target_modules=target,

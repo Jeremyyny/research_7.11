@@ -3,7 +3,7 @@
 > **ARCHIVED TRANSFER-ORIENTED PLAN.** The main paper no longer uses a
 > MedQA-trained manager as the policy for other datasets. Use
 > **[IN_DOMAIN_EXPERIMENTS.md](IN_DOMAIN_EXPERIMENTS.md)**: all four benchmarks
-> independently train advisors, cold-start, and GRPO, then evaluate on their
+> independently train sub-agents, cold-start, and GRPO, then evaluate on their
 > own question-disjoint held-out sets. Commands below are retained only to
 > reproduce older runs and must not define new experiments.
 
@@ -48,7 +48,7 @@ back only if stage 2 OOMs).
 ## 1. Hardware layout and environments
 
 ```
-GPU 0  →  vLLM server: base model + 3 LoRA advisors (~27 GB)
+GPU 0  →  vLLM server: base model + 3 LoRA sub-agents (~27 GB)
 GPU 1  ┐
 GPU 2  ├→ accelerate + DeepSpeed (manager GRPO, full-parameter)
 GPU 3  ┘
@@ -67,14 +67,14 @@ Global config used by every command below (put in an `env.sh` and `source` it):
 
 ```bash
 export PYTHONUTF8=1
-export BASE_MODEL=Qwen/Qwen3-8B
+export BASE_MODEL=Qwen/Qwen3.5-9B
 export TEACHER_ID=commit_gpt_8b            # namespaces ALL outputs of this run family
 export PROVIDER=openai
 export MODEL=gpt-4o
 export OPENAI_API_KEY=...
 export MEDQA_CACHE=outputs/data/medqa_us4_normalized.jsonl
 export TASK_DESC="You are a manager agent solving USMLE-style medical multiple-choice questions."
-# split budget: 3x500 advisor SFT + 300 cold start + ~600 GRPO, all inside the train pool
+# split budget: 3x500 sub-agent SFT + 300 cold start + ~600 GRPO, all inside the train pool
 export SPLIT="--train_size 1400 --dev_size 200 --test_size 500"
 ```
 
@@ -97,16 +97,16 @@ running four cramped in-domain pipelines.
 | **LegalBench** (5 tasks) | zero-shot probe, easy end | ~380 test rows total | too small to train honestly (3×SFT + coldstart + GRPO would overlap); binary labels = high base accuracy → expect lowest delegation depth |
 | **MMLU-Pro** | zero-shot probe, harder (10 options) | 12,032 test | community evaluates on the full test split — training on any part breaks comparability |
 | **GPQA-Diamond** | zero-shot probe, hardest | 198 | too small to train; expect max delegation depth |
-| GPQA train pool | *optional* in-domain hard replication (§8.4) | 446 = 98 diamond + 348 non-diamond (`scripts/build_gpqa_splits.py`) | eval = 100 held-out diamond; leftover diamond goes INTO training — the hardest questions teach deep delegation |
+| GPQA train pool | *optional* in-domain hard replication (§8.4) | 348 non-diamond only (`scripts/build_gpqa_splits.py`) | ALL 198 diamond questions held out for eval — no diamond question may touch any training stage |
 
 **MedQA budget** (all training draws come from a fixed 1,400-row window of the
 train split; dev is carved from the train tail — never from test):
 
 | Pool | Rows | Disjointness |
 |---|---|---|
-| Advisor SFT (per kind ×3) | 500 accepted | the 3 kinds may share questions with each other |
-| Manager cold-start | 300 | excluded from advisor-SFT ids/hashes |
-| Manager GRPO | ≈600 | excluded from advisor-SFT ∪ cold-start |
+| Sub-agent SFT (per kind ×3) | 500 accepted | the 3 kinds may share questions with each other |
+| Manager cold-start | 300 | excluded from sub-agent-SFT ids/hashes |
+| Manager GRPO | ≈600 | excluded from sub-agent-SFT ∪ cold-start |
 | Dev (sanity only) | 200 | carved from train tail |
 | Test (dev-phase) | 500 | HF test split |
 | Test (final paper numbers) | 1,273 (full) | rerun Stage D + §7 rows once at the end |
@@ -120,19 +120,19 @@ honors loader labels, so the FULL probe is evaluated):
 | MMLU-Pro | 500 sampled from 12k | `--train_size 0 --dev_size 0 --test_size 500` |
 | GPQA-Diamond | 198 (all) | `--train_size 0 --dev_size 0 --test_size 198` |
 
-## 1.6 Hyperparameter defaults (8B, experience-based)
+## 1.6 Hyperparameter defaults (Qwen3.5-9B, 4×96GB target)
 
 | Stage | Setting | Value | Rationale |
 |---|---|---|---|
 | Synthesis | temperature / retries / workers | 0.4 / 2 / 8 | schema-validity sweet spot; retries bump temp +0.15 |
-| Advisor SFT | lr / epochs / LoRA / batch | 5e-5 / 3 / r16 α32 / bs1×ga8, seq 4096 | lr ≥ 1e-4 destabilizes 8B; 500×3ep ≈ 190 updates |
+| Sub-agent SFT | lr / epochs / LoRA / batch | 5e-5 / 3 / r16 α32 / bs1×ga8, seq 8192 | validate each role on held-out SFT data |
 | Cold start | n / epochs / lr | 300 / 2 / 5e-6 | format only; 1 epoch sometimes leaves `tools/call_frequency≈0`, 2 is safer at this lr |
-| GRPO (main) | bs / gens / temp / completion | 2×3GPU / **6** / 1.0 / 3072 | gens must divide global batch (6); 3072 fits 3-advisor trajectories |
-| GRPO (main) | beta / clip_high / steps | 0.01 / 0.28 / 300 | DAPO clip-higher for exploration; 300 steps = 300 questions × 6 rollouts ≈ ½ pass over 600 |
+| GRPO (main) | bs / gens / generation batch / completion | 8×3GPU / **8** / 8 / 1024 | global batch 24; strict routing-only Manager |
+| GRPO (main) | beta / clip_high / steps | 0.001 / 0.28 / 300 | recent agentic GRPO work commonly uses KL≈0.001; keep 0.01 as a stability ablation |
 | ADC reward | draft / missing / final / cost | 0.2 / 0.1 / 1.0 / 0.05 | verified ordering: k=0 1.20 > k=2 honest 1.10 > k=3 1.05 > sandbag 1.03; drafts 1.10 > omitted 0.90 |
 | Pareto grid | cost_per_tool | 0.02 / 0.05 / 0.10 / 0.20 | spans "almost free" → "one call must flip ~⅕ of answers to pay off" |
-| GPQA in-domain (§8.4) | steps / beta | 120 / 0.02 | ~196 GRPO rows ⇒ ~4 passes; stronger KL against overfitting |
-| Eval | decoding | greedy, max_new 1024 | deterministic; SC baseline uses temp 0.7 |
+| GPQA in-domain (§8.4) | steps / beta | 120 / 0.001 | ~196 GRPO rows ⇒ ~4 passes; stronger KL against overfitting |
+| Eval | routing Manager | greedy, 256/turn, 1024 total | actual Manager and sub-agent tokens reported separately |
 
 ---
 
@@ -159,18 +159,18 @@ python -m src.pipeline.cli load_gpqa --base_model "$BASE_MODEL" \
     --gpqa_normalized_cache outputs/data/gpqa_diamond_normalized.jsonl \
     --train_size 0 --dev_size 0 --test_size 198
 
-# GPQA train/eval split for the §8.4 in-domain replication. GPQA is 546
-# questions TOTAL (nested: diamond 198 ⊆ main 448 ⊆ extended 546). This holds
-# out 100 diamond questions for eval and pools the remaining 98 diamond +
-# 348 non-diamond = 446 for training (hash-disjoint, asserted):
-python scripts/build_gpqa_splits.py --eval_n 100 --seed 42
-# -> outputs/data/gpqa_diamond_eval100.jsonl  (100 rows, split=test)
-# -> outputs/data/gpqa_train446.jsonl         (446 rows, split=train)
+# GPQA split for the §8.4 in-domain replication. GPQA is 546 questions
+# TOTAL (nested: diamond 198 ⊆ main 448 ⊆ extended 546). Policy: ALL 198
+# diamond questions are held out for eval; training uses only the 348
+# non-diamond questions (hash-disjoint, asserted by the script):
+python scripts/build_gpqa_splits.py --eval_n 198 --seed 42
+# -> outputs/data/gpqa_diamond_eval198.jsonl     (198 rows, split=test)
+# -> outputs/data/gpqa_nondiamond_train348.jsonl (348 rows, split=train)
 ```
 
 ---
 
-## 3. Stage A — build the three frozen advisors
+## 3. Stage A — build the three frozen sub-agents
 
 Synthesis (~30–60 min per kind at 8 workers). The verifier automatically audits
 a random candidate on ~50% of samples; `--synth_symmetric_leakage` audits ALL
@@ -245,7 +245,7 @@ curl http://localhost:8000/v1/models | python -m json.tool   # expect: extractor
 
 Terminal B (GPUs 1–3). The launch script pins the remote venv and sets
 bs 2 × 3 GPUs = global batch 6 = `num_generations` (1 question × 6 rollouts
-per step; completion budget 3072 for 3-advisor trajectories):
+per step; completion budget 1024 for 3-sub-agent trajectories):
 
 ```bash
 EXCL="--exclude_sft_example_ids outputs/sft_data/${TEACHER_ID}/extractor_sft.jsonl \
@@ -286,8 +286,8 @@ PY
 # if ~0: the cold-start adapter was not loaded — check --mgr_init_adapter path.
 ```
 
-~300 steps ≈ 6–10 h on 3× H100 (advisor outputs are cached per question, so
-rollouts 2–6 on the same question pay no advisor cost).
+~300 steps ≈ 6–10 h on 3× H100 (sub-agent outputs are cached per question, so
+rollouts 2–6 on the same question pay no sub-agent cost).
 
 ---
 
@@ -312,13 +312,13 @@ python -m src.pipeline.cli eval_manager_tools \
 | 1 | 8B zero-shot CoT (floor) | (a) |
 | 2 | 8B + self-consistency@4 (matched-compute control) | (b) |
 | 3 | 8B + direct CoT distillation (distillation-confound control) | (c) |
-| 4 | 8B + all three advisors, forced (fixed-depth structure ceiling) | (d) |
+| 4 | 8B + all three sub-agents, forced (fixed-depth structure ceiling) | (d) |
 | 5 | 8B + learned orchestrator | Stage D |
 | 6 | Frontier reference (GPT-4o direct) | one-off API script, or cite reported numbers |
 
 **(a) zero-shot floor** — note: needs a local snapshot of the base model
 (eval loads `--eval_manager_dir` as a directory; `huggingface-cli download
-Qwen/Qwen3-8B --local-dir models/qwen3-8b` once, or point at any full local copy):
+Qwen/Qwen3.5-9B --local-dir models/qwen3-8b` once, or point at any full local copy):
 
 ```bash
 python -m src.pipeline.cli eval_manager \
@@ -329,7 +329,7 @@ python -m src.pipeline.cli eval_manager \
 ```
 
 **(b) self-consistency@k.** Match its token budget to row 5's delegation
-budget (avg_tool_calls × ~2k tokens per advisor round-trip; avg ≈ 1.5 → k ≈ 4):
+budget (avg_tool_calls × ~2k tokens per sub-agent round-trip; avg ≈ 1.5 → k ≈ 4):
 
 ```bash
 python -m src.pipeline.cli eval_manager \
@@ -342,7 +342,7 @@ python -m src.pipeline.cli eval_manager \
 ```
 
 **(c) distillation control** — same teacher, same question pool,
-teacher-token budget matched to advisor-SFT + cold-start, distilled as plain
+teacher-token budget matched to sub-agent-SFT + cold-start, distilled as plain
 CoT into a single model:
 
 ```bash
@@ -396,7 +396,7 @@ python -m src.pipeline.cli eval_manager \
 ```
 
 **(d) fixed all-three baseline** — forced delegation; the manager only writes
-the final answer given all three advisor outputs:
+the final answer given all three sub-agent outputs:
 
 ```bash
 python -m src.pipeline.cli eval_manager_forced \
@@ -417,7 +417,7 @@ approaches row6.
 
 ### 8.1 Fixed-k baselines + the stopping oracle (Fig. B; also the k-points of Fig. A)
 
-Run the forced eval over all 8 advisor subsets (advisor outputs are cached —
+Run the forced eval over all 8 sub-agent subsets (sub-agent outputs are cached —
 after the first pass each run only pays manager generation):
 
 ```bash
@@ -547,48 +547,15 @@ PY
 
 ### 8.4 Optional — in-domain replication on GPQA (hard domain)
 
-Replicates RQ1 rows 4–5 and the regret analysis on a much harder domain.
-Split (from `scripts/build_gpqa_splits.py`, §2): **eval = 100 held-out diamond
-questions; train pool = 446** (98 leftover diamond + 348 non-diamond). Budget
-inside the 446: advisor SFT 160 (the three kinds share rows), cold start 50,
-dev 40, GRPO ≈ 196 (the remainder, enforced by hash exclusions).
+Policy: **all 198 diamond questions are eval-only**; training draws exclusively
+from the 348 non-diamond questions (sub-agent SFT 100 / cold start 40 / dev 30 /
+GRPO ≈178). No diamond question may appear in sub-agent synthesis, base
+predictions, cold start, GRPO, dev selection, prompt tuning, or reward tuning.
 
-> The GPQA-trained manager is evaluated on `gpqa_diamond_eval100` ONLY — 98
-> diamond questions sit in its training pool. The full-198 diamond probe in
-> §8.3 remains valid for the *MedQA-trained* manager, which never saw GPQA.
-
-```bash
-export GPQA_ID=ds_gpqa
-export GPQA_TASK="You are a manager agent solving expert-level graduate science multiple-choice questions."
-export GPQA_TRAIN="--gpqa_normalized_cache outputs/data/gpqa_train446.jsonl --train_size 0 --dev_size 40 --test_size 0"
-
-# 1) advisor SFT data via the offline DeepSeek bridge (160 per kind)
-for KIND in extractor reasoner verifier; do
-  python -m src.pipeline.cli export_deepseek_jsonl       --agent_kind "$KIND" --teacher_id "$GPQA_ID" $GPQA_TRAIN --n_samples 160
-done
-#   ...run DeepSeek on outputs/sft_data/$GPQA_ID/*_deepseek_prompts.jsonl...
-for KIND in extractor reasoner verifier; do
-  python -m src.pipeline.cli import_deepseek_jsonl       --agent_kind "$KIND" --teacher_id "$GPQA_ID"       --deepseek_prompt_jsonl  "outputs/sft_data/${GPQA_ID}/${KIND}_deepseek_prompts.jsonl"       --deepseek_response_jsonl "outputs/sft_data/${GPQA_ID}/${KIND}_deepseek_responses.jsonl"
-  python -m src.pipeline.cli train_subagent       --base_model "$BASE_MODEL" --teacher_id "$GPQA_ID" --agent_kind "$KIND"       --sft_epochs 4 --sft_lr 5e-5 --sft_bs 1 --sft_grad_accum 8
-done
-
-# 2) cold start (50 rows, hash-excluded from advisor rows)
-GPQA_EXCL="--exclude_sft_example_ids outputs/sft_data/${GPQA_ID}/extractor_sft.jsonl            --exclude_sft_example_ids outputs/sft_data/${GPQA_ID}/reasoner_sft.jsonl            --exclude_sft_example_ids outputs/sft_data/${GPQA_ID}/verifier_sft.jsonl"
-python -m src.pipeline.cli manager_coldstart_sft     --base_model "$BASE_MODEL" --teacher_id "$GPQA_ID" $GPQA_TRAIN $GPQA_EXCL     --coldstart_n_samples 50 --coldstart_force_diverse     --manager_sft_epochs 2 --manager_sft_lr 5e-6     --task_description "$GPQA_TASK"
-
-# 3) GRPO on the ~196 remaining rows
-#    (terminal A now serves the GPQA advisors:
-#     bash scripts/start_subagent_server.sh "$BASE_MODEL" "$GPQA_ID")
-bash scripts/train_manager_grpo_multigpu.sh "$GPQA_ID"     --base_model "$BASE_MODEL" $GPQA_TRAIN $GPQA_EXCL     --exclude_sft_example_ids "outputs/manager/${GPQA_ID}/evolve/manager_sft_coldstart_diverse.jsonl"     --mgr_init_adapter "outputs/manager/${GPQA_ID}/sft_coldstart"     --mgr_output_dir "outputs/manager/${GPQA_ID}/grpo_anytime_c05"     --mgr_adc_mode --mgr_adc_variant anytime --mgr_adc_cost_per_tool 0.05     --mgr_grpo_beta 0.02 --mgr_clip_epsilon_high 0.28 --mgr_max_steps 120     --mgr_use_wandb --wandb_project agent_routing     --wandb_run_name "${GPQA_ID}_anytime_c05"     --task_description "$GPQA_TASK"
-
-# 4) eval STRICTLY on the 100 held-out diamond questions
-python -m src.pipeline.cli eval_manager_tools     --base_model "$BASE_MODEL" --teacher_id "$GPQA_ID"     --gpqa_normalized_cache outputs/data/gpqa_diamond_eval100.jsonl     --train_size 0 --dev_size 0 --test_size 100 --eval_n_samples 100     --eval_manager_dir "outputs/manager/${GPQA_ID}/grpo_anytime_c05"     --task_description "$GPQA_TASK"
-```
-
-Cheaper alternative: skip step 1 and transfer the MedQA advisors + cold start
-(`--subagent_teacher_id "$TEACHER_ID"`, `--mgr_init_adapter` from the MedQA
-cold start, server serving the MedQA adapters); then everything but dev goes
-to GRPO (~406 rows, `--mgr_max_steps 200`).
+The full command sequence (base-prediction verifier candidates, DeepSeek
+synthesis, shared-row selection, audits, GRPO, eval) lives in
+**IN_DOMAIN_EXPERIMENTS.md §7** — follow it verbatim. Caches come from
+`scripts/build_gpqa_splits.py` (§2 above).
 
 ---
 
@@ -678,4 +645,4 @@ PY
 | Fig. B regret | §8.1 snippet over `manager_forced_*.jsonl` + `manager_tool_eval.jsonl` |
 | Fig. C transfer + AURC | `outputs/eval/<id>/transfer_*_manager_tool_eval*` |
 | RQ3 sandbagging curve | per-arm `train_raw_trace.jsonl` |
-| Advisor quality gates | `outputs/sft_data/<id>/*_sft.jsonl.meta.json`, `outputs/eval/<id>/subagent_eval_report.json` |
+| Sub-agent quality gates | `outputs/sft_data/<id>/*_sft.jsonl.meta.json`, `outputs/eval/<id>/subagent_eval_report.json` |
