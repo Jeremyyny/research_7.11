@@ -224,6 +224,7 @@ class _RemoteManagerDraftGenerator:
             "temperature": 0.0,
             "max_tokens": self.max_new_tokens,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+          "chat_template_kwargs": {"enable_thinking": false}
         }
         resp = _requests.post(
             f"{self.server_url}/v1/chat/completions",
