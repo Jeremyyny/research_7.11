@@ -84,10 +84,12 @@ def build_manager_system_prompt(
         + hint_block + "\n"
         "Output rules:\n"
         "  - Use the native tool-calling interface. Do NOT write tool calls as text, XML, or JSON.\n"
-        "  - In a turn where you call a tool, output exactly one DRAFT_ANSWER_ line "\n        "plus the native tool call, but NOT the final ANSWER_.\n"
+        "  - In a turn where you call a tool, output exactly one DRAFT_ANSWER_ line \n"
+        "    plus the native tool call, but NOT the final ANSWER_.\n"
         "  - When you are ready to submit your final answer (no more tools), end with exactly:\n"
         + answer_lines + "\n"
-        "  - Do not provide free-form reasoning, explanations, JSON, or XML in text.\n"\n        "  - A final turn contains exactly one ANSWER_ line and nothing else.\n"
+        "  - Do not provide free-form reasoning, explanations, JSON, or XML in text.\n"
+        "  - A final turn contains exactly one ANSWER_ line and nothing else.\n"
         "  - Do not output <think> tags.\n"
     )
 
