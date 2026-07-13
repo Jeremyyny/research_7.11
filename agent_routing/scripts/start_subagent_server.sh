@@ -49,7 +49,7 @@ case "${BASE_MODEL,,}" in
     # This project is text-only. Skip the vision encoder/profiling and enable
     # Qwen3.5 reasoning parsing while keeping each sub-agent explicitly
     # non-thinking through chat_template_kwargs in RemoteSubagentPool.
-    EXTRA_MODEL_ARGS+=(--language-model-only --reasoning-parser qwen3)
+    EXTRA_MODEL_ARGS+=(--language-model-only --reasoning-parser qwen3 --override-generation-config '{"enable_thinking": false}')
     ;;
 esac
 
