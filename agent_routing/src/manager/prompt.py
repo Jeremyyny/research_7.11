@@ -124,20 +124,34 @@ def build_manager_user_message(
     return "\n".join(lines)
 
 
+# def parse_final_answer(text: str, choice_keys: List[str]) -> Optional[str]:
+#     """Parse the final ANSWER_<TOKEN> line and map to a canonical choice key."""
+#     if not text:
+#         return None
+#     lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+#     if not lines:
+#         return None
+#     m = ANSWER_LASTLINE_RE_FOR_KEYS.match(lines[-1])
+#     if not m:
+#         return None
+#     token = m.group(1).upper()
+#     for k in choice_keys:
+#         if _label_to_token(k) == token:
+#             return k
+#     return None
 def parse_final_answer(text: str, choice_keys: List[str]) -> Optional[str]:
-    """Parse the final ANSWER_<TOKEN> line and map to a canonical choice key."""
+    """Parse the final ANSWER_<TOKEN> and map to a canonical choice key."""
     if not text:
         return None
     lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
-    if not lines:
-        return None
-    m = ANSWER_LASTLINE_RE_FOR_KEYS.match(lines[-1])
-    if not m:
-        return None
-    token = m.group(1).upper()
-    for k in choice_keys:
-        if _label_to_token(k) == token:
-            return k
+    for ln in reversed(lines):
+        m = ANSWER_LASTLINE_RE_FOR_KEYS.search(ln)
+        if not m:
+            continue
+        token = m.group(1).upper()
+        for k in choice_keys:
+            if _label_to_token(k) == token:
+                return k
     return None
 
 
