@@ -926,8 +926,29 @@ class ManagerSFTConfig:
     max_steps: int = -1
     bf16: bool = True
 
-
+def _normalize_tool_args(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """HF chat templates want tool_call arguments as a dict; the OpenAI API wants a JSON string."""
+    out = []
+    for m in messages:
+        m = dict(m)
+        if m.get("tool_calls"):
+            tcs = []
+            for tc in m["tool_calls"]:
+                tc = dict(tc)
+                fn = dict(tc.get("function", {}))
+                a = fn.get("arguments")
+                if isinstance(a, str):
+                    try:
+                        fn["arguments"] = json.loads(a) if a.strip() else {}
+                    except json.JSONDecodeError:
+                        fn["arguments"] = {}
+                tc["function"] = fn
+                tcs.append(tc)
+            m["tool_calls"] = tcs
+        out.append(m)
+    return out
 def _render_chat(tokenizer, messages, add_generation_prompt: bool) -> str:
+    messages = _normalize_tool_args(messages)
     try:
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=add_generation_prompt,
