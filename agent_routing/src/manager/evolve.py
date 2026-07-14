@@ -169,7 +169,7 @@ def _tool_call_message(
         "tool_calls": [{
             "id": call_id,
             "type": "function",
-            "function": {"name": tool_name, "arguments": args},
+            "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
         }],
     }
     if content:
