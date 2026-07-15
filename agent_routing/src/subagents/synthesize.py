@@ -235,6 +235,7 @@ def synthesize_subagent_data(
     stratify_by: str = "",
     verifier_candidate_map: Optional[Dict[int, str]] = None,
     random_verifier_candidates: bool = False,
+    allow_empty_verifier_candidates: bool = False,
 ) -> SynthStats:
     """Synthesize SFT data for one subagent.
 
@@ -260,6 +261,22 @@ def synthesize_subagent_data(
         auditor = LeakageAuditor()
 
     pool = _balanced_pool(rows, stratify_by, seed)
+    if (
+        agent_kind == AgentKind.VERIFIER
+        and not random_verifier_candidates
+        and not allow_empty_verifier_candidates
+    ):
+        candidate_map = verifier_candidate_map or {}
+        pool = [
+            row for row in pool
+            if candidate_map.get(int(row.example_id), "") in row.choices
+        ]
+        if len(pool) < n_samples:
+            raise ValueError(
+                "Not enough candidate-bound rows to satisfy verifier synthesis: "
+                f"requested={n_samples}, available={len(pool)}. Export more base "
+                "predictions or lower --n_samples."
+            )
 
     stats = SynthStats(requested=n_samples)
     _lock = threading.Lock()
@@ -471,8 +488,11 @@ def synthesize_subagent_data(
         "gt_visible_to_teacher": False,
         "stratify_by": stratify_by,
         "verifier_candidate_source": (
-            "manager_prediction" if verifier_candidate_map else
-            ("random" if random_verifier_candidates else "none")
+            "manager_prediction_with_random_fallback"
+            if verifier_candidate_map and random_verifier_candidates else
+            ("manager_prediction" if verifier_candidate_map else
+             ("random" if random_verifier_candidates else
+              ("explicitly_empty" if allow_empty_verifier_candidates else "missing")))
         ),
         "accepted_by_stratum": accepted_by_stratum,
     })
