@@ -212,8 +212,8 @@ class _RemoteManagerDraftGenerator:
             return None
         calibration = (
             "\n\nCalibration pass: tools are temporarily unavailable. Based only on "
-            "the conversation above, report your current best answer. End with exactly "
-            "one ANSWER_<TOKEN> line."
+            "the conversation above, report your current best answer. Put your answer "
+            "on the FIRST line as exactly one ANSWER_<TOKEN> line, then reasoning may follow."
         )
         request_messages = [dict(m) for m in messages]
         request_messages[0] = dict(request_messages[0])
@@ -291,8 +291,8 @@ def _predict_base_initial_drafts(
         answer_lines = "\n".join(f"ANSWER_{_label_to_token(k)}" for k in keys)
         system = (
             (task_description or "Solve the multiple-choice question.")
-            + "\nTools are unavailable in this calibration pass. Reason briefly, "
-              "then end with exactly one valid answer line:\n"
+            + "\nTools are unavailable in this calibration pass. Put your answer on the "
+              "FIRST line as exactly one of the following, then reasoning may follow:\n"
             + answer_lines
         )
         user = build_manager_user_message(
