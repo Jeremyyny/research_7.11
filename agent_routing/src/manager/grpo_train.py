@@ -49,6 +49,10 @@ from ..subagents.runtime import (
     SubagentPool,
     default_subagent_max_new_tokens,
 )
+from ..utils.chat_template import (
+    ensure_nothink_chat_template,
+    generation_prompt_opens_think,
+)
 from ..utils.io import write_json
 from ..utils.modeling import load_text_causal_lm
 from ..utils.seed import set_seed
@@ -211,6 +215,109 @@ class ManagerToolEnvironment:
             getattr(self, "example_id", -1),
             candidate_answer=str(current_draft or ""),
         )
+
+
+# ----------------------- Tool interface pre-flight -----------------------
+
+_PREFLIGHT_TOOL_CALL = {
+    "id": "preflight_1",
+    "type": "function",
+    "function": {"name": "verifier_tool", "arguments": {"current_draft": "B"}},
+}
+
+
+def preflight_tool_interface_check(tok, chat_template_kwargs: Dict[str, Any]) -> None:
+    """Fail fast if the template <-> parser round trip cannot carry a tool call.
+
+    The failure mode this guards against is *silent*: if the generation prompt
+    ends with an open ``<think>`` tag, or the response template/schema does not
+    match the format the chat template renders, TRL decodes every completion
+    without a ``tool_calls`` field, no tool ever executes, tools/call_frequency
+    logs 0.0 forever, and the reward collapses — with no error raised anywhere.
+    Set AGENT_ROUTING_SKIP_PREFLIGHT=1 to bypass (not recommended).
+    """
+    if os.environ.get("AGENT_ROUTING_SKIP_PREFLIGHT", "0") == "1":
+        print("[MANAGER_GRPO] preflight skipped via AGENT_ROUTING_SKIP_PREFLIGHT=1")
+        return
+
+    # 1) In non-thinking mode, the generation prompt must not end with an open
+    #    <think> tag — with the configured kwargs AND without them (the bare
+    #    render covers TRL/vLLM render sites that may not forward
+    #    chat_template_kwargs). In thinking mode an open <think> is expected:
+    #    the model closes it before calling tools, which parses fine.
+    thinking_mode = bool(chat_template_kwargs.get("enable_thinking"))
+    if not thinking_mode and generation_prompt_opens_think(tok, chat_template_kwargs):
+        raise RuntimeError(
+            "Tool-call preflight failed: the generation prompt ends with an "
+            "open <think> tag even with the configured chat_template_kwargs "
+            f"({chat_template_kwargs}). The tool-call parser will swallow "
+            "every completion into reasoning_content and the tool call rate "
+            "will be 0. Use a nothink chat template (see "
+            "src/utils/chat_template.ensure_nothink_chat_template) or set "
+            "enable_thinking accordingly."
+        )
+    if not thinking_mode and generation_prompt_opens_think(tok):
+        print(
+            "[MANAGER_GRPO] WARNING: the chat template still opens <think> when "
+            "enable_thinking is not passed. Render sites that drop "
+            "chat_template_kwargs will silently break tool-call parsing."
+        )
+
+    # 2) Round-trip a native tool call through the template and the parser the
+    #    trainer will actually use (response_template / response_schema).
+    has_parser = (
+        getattr(tok, "response_template", None) is not None
+        or getattr(tok, "response_schema", None) is not None
+    )
+    if not has_parser:
+        raise RuntimeError(
+            "Tool-call preflight failed: the tokenizer has neither "
+            "response_template nor response_schema, so TRL will decode "
+            "completions as plain text and never see a tool call. "
+            "trl.chat_template_utils.add_response_schema most likely failed "
+            "to recognize this chat template — check the TRL version."
+        )
+    conversation = [
+        {"role": "user", "content": "preflight"},
+        {"role": "assistant", "content": "DRAFT_ANSWER_B", "tool_calls": [_PREFLIGHT_TOOL_CALL]},
+    ]
+    prompt_ids = tok.apply_chat_template(
+        conversation[:1], add_generation_prompt=True, tokenize=True,
+        **chat_template_kwargs,
+    )
+    full_text = tok.apply_chat_template(
+        conversation, add_generation_prompt=False, tokenize=False,
+        **chat_template_kwargs,
+    )
+    prompt_text = tok.apply_chat_template(
+        conversation[:1], add_generation_prompt=True, tokenize=False,
+        **chat_template_kwargs,
+    )
+    if not full_text.startswith(prompt_text):
+        raise RuntimeError(
+            "Tool-call preflight failed: the chat template is not "
+            "prefix-preserving for a tool-calling assistant turn."
+        )
+    completion_ids = tok(full_text[len(prompt_text):], add_special_tokens=False)["input_ids"]
+    try:
+        from trl.chat_template_utils import parse_response as _trl_parse_response
+        parsed = _trl_parse_response(tok, completion_ids, prefix=prompt_ids)
+    except ImportError:
+        parsed = tok.parse_response(completion_ids, prefix=prompt_ids)
+    if not parsed.get("tool_calls"):
+        raise RuntimeError(
+            "Tool-call preflight failed: a tool call rendered by this chat "
+            "template does not parse back into `tool_calls` "
+            f"(parsed={parsed!r}). The trainer would log tools/call_frequency "
+            "= 0 forever. Check that the response template/schema matches the "
+            "chat template (trl.chat_template_utils.add_response_schema) and "
+            "that the template does not default to thinking mode."
+        )
+    print(
+        "[MANAGER_GRPO] tool-interface preflight OK: "
+        f"parsed tool_calls={[(tc.get('function') or {}).get('name') for tc in parsed['tool_calls']]}, "
+        f"content={parsed.get('content')!r}"
+    )
 
 
 # ----------------------- Trainer entry point -----------------------
@@ -386,11 +493,47 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
     manager_tok.padding_side = "left"
     if manager_tok.pad_token_id is None and manager_tok.eos_token_id is not None:
         manager_tok.pad_token_id = manager_tok.eos_token_id
+
+    # Qwen3.5 ships the THINK template variant: by default the generation
+    # prompt ends with an open `<think>` tag, and the tool-call parser then
+    # swallows the whole (non-thinking) completion into reasoning_content —
+    # tool call rate reads exactly 0, silently. Normalize the template default
+    # to nothink BEFORE the response schema is chosen, so both match.
+    if not cfg.enable_thinking:
+        ensure_nothink_chat_template(manager_tok, tag="MANAGER_GRPO")
+
     if HAS_RESP_SCHEMA:
         try:
             manager_tok = add_response_schema(manager_tok)
-        except Exception:
-            pass
+        except Exception as e:
+            # Do NOT swallow this silently: without a response template/schema
+            # TRL falls back to plain-text decoding and never parses a tool
+            # call. The preflight below turns this into a hard error.
+            print(f"[MANAGER_GRPO] WARNING: add_response_schema failed: {e}")
+
+    preflight_tool_interface_check(
+        manager_tok, {"enable_thinking": bool(cfg.enable_thinking)}
+    )
+
+    # Tool results are appended INSIDE the completion budget: TRL rolls back
+    # any tool result that would push the sequence past max_completion_length,
+    # so a budget smaller than a single subagent reply makes every tool call
+    # useless even when parsing works.
+    _max_tool_tokens = max(
+        default_subagent_max_new_tokens(k)
+        for k in ("extractor", "reasoner", "verifier")
+    )
+    _recommended = _max_tool_tokens * 2 + 512
+    if cfg.max_completion_length < _max_tool_tokens + 256:
+        print(
+            f"[MANAGER_GRPO] WARNING: max_completion_length="
+            f"{cfg.max_completion_length} cannot fit a single largest tool "
+            f"reply ({_max_tool_tokens} tokens) plus the manager's turns. "
+            f"TRL will roll the tool results back and trajectories will end "
+            f"tool-less. Use at least {_recommended} "
+            f"(--mgr_max_completion_length {_recommended}) or lower "
+            f"SUBAGENT_*_MAX_NEW_TOKENS."
+        )
 
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     is_full_init = (

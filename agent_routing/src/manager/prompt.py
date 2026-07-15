@@ -94,6 +94,58 @@ def build_manager_system_prompt(
     )
 
 
+def build_manager_tool_schemas(binding_mode: str) -> List[Dict[str, Any]]:
+    """OpenAI-style JSON schemas for the three manager tools.
+
+    Single source of truth shared by manager SFT (rendered into the prompt so
+    training matches rollout), evaluation, and any server-side tool wiring.
+    GRPO training passes Python callables to TRL, which derives equivalent
+    schemas from their signatures/docstrings — keep both in sync.
+    """
+    required = ["example_id"] if binding_mode == "argument" else []
+    properties: Dict[str, Any] = (
+        {
+            "example_id": {
+                "type": "integer",
+                "description": "The current example ID from the user message.",
+            }
+        }
+        if binding_mode == "argument"
+        else {}
+    )
+    verifier_properties = dict(properties)
+    verifier_properties["current_draft"] = {
+        "type": "string",
+        "description": "Your current draft answer key (e.g. \"B\") to audit.",
+    }
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "extractor_tool",
+                "description": "Extract decision-relevant factual signals from the question and context.",
+                "parameters": {"type": "object", "properties": properties, "required": required},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reasoner_tool",
+                "description": "Produce a structured reasoning scaffold for the choices.",
+                "parameters": {"type": "object", "properties": properties, "required": required},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "verifier_tool",
+                "description": "Identify relevant domain principles and audit the reasoning for logical or computational errors. Pass your current draft answer via current_draft.",
+                "parameters": {"type": "object", "properties": verifier_properties, "required": required},
+            },
+        },
+    ]
+
+
 def build_manager_user_message(
     example_id: int,
     question: str,

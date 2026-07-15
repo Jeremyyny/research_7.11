@@ -51,6 +51,10 @@ done
 # num_generations=8 exactly divides the global batch (3 GPUs x bs 8 = 24); the
 # reward mode (--mgr_adc_mode etc.) is intentionally NOT set here — pass it
 # per experiment arm (see EXPERIMENTS.md).
+# max_completion_length=4096: TRL counts injected tool-result tokens against
+# the completion budget and ROLLS BACK any tool result that would exceed it.
+# The reasoner alone can return 1024 tokens, so 1024 made every tool call
+# useless; 4096 fits a 3-tool trajectory (512+1024+768 tool tokens + turns).
 VENV_DIR="${VENV_DIR:-/home/yizzhao/research_0703/.venv}"
 VIRTUAL_ENV="${VENV_DIR}" PATH="${VENV_DIR}/bin:$PATH" CUDA_VISIBLE_DEVICES=1,2,3 \
 PYTHONUTF8=1 \
@@ -63,7 +67,7 @@ accelerate launch \
     --mgr_bs 8 \
     --mgr_num_generations 8 \
     --mgr_generation_batch_size 8 \
-    --mgr_max_completion_length 1024 \
+    --mgr_max_completion_length 4096 \
     --mgr_temperature 1.0 \
     --mgr_top_p 0.95 \
     --mgr_top_k 20 \

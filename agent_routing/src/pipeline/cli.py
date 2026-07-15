@@ -195,7 +195,12 @@ def _parse_args() -> argparse.Namespace:
 
     # Manager GRPO
     parser.add_argument("--mgr_bs", type=int, default=2)
-    parser.add_argument("--mgr_max_completion_length", type=int, default=1024)
+    parser.add_argument("--mgr_max_completion_length", type=int, default=4096,
+                        help="Completion budget per rollout. Tool results count "
+                             "against it (TRL rolls back tool results that would "
+                             "exceed it), so it must fit the subagent replies: "
+                             "extractor 512 + reasoner 1024 + verifier 768 plus "
+                             "the manager's own turns.")
     parser.add_argument("--mgr_temperature", type=float, default=0.9)
     parser.add_argument("--mgr_top_p", type=float, default=0.95)
     parser.add_argument("--mgr_top_k", type=int, default=20)

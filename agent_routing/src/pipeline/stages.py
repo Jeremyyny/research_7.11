@@ -1195,6 +1195,7 @@ def run_manager_coldstart_sft(
         gradient_accumulation_steps=gradient_accumulation_steps,
         use_lora=use_lora,
         max_steps=max_steps,
+        binding_mode=("argument" if ctx.binding_mode == "argument" else "environment"),
     )
     train_manager_sft(train_cfg)
     print(f"[COLDSTART] manager saved -> {ctx.manager_coldstart_dir()}")
@@ -1238,6 +1239,7 @@ def run_train_manager_sft(
         lora_r=lora_r,
         lora_alpha=lora_alpha,
         max_steps=max_steps,
+        binding_mode=("argument" if ctx.binding_mode == "argument" else "environment"),
     )
     train_manager_sft(cfg)
     return {"manager_sft_dir": out_dir}
@@ -1613,57 +1615,39 @@ def run_eval_manager(
 
 
 def _manager_tool_schemas(binding_mode: str) -> List[Dict[str, Any]]:
-    required = ["example_id"] if binding_mode == "argument" else []
-    properties = (
-        {
-            "example_id": {
-                "type": "integer",
-                "description": "The current example ID from the user message.",
-            }
-        }
-        if binding_mode == "argument"
-        else {}
-    )
-    verifier_properties = dict(properties)
-    verifier_properties["current_draft"] = {
-        "type": "string",
-        "description": "Your current draft answer key (e.g. \"B\") to audit.",
-    }
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "extractor_tool",
-                "description": "Extract decision-relevant factual signals from the question and context.",
-                "parameters": {"type": "object", "properties": properties, "required": required},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "reasoner_tool",
-                "description": "Produce a structured reasoning scaffold for the choices.",
-                "parameters": {"type": "object", "properties": properties, "required": required},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "verifier_tool",
-                "description": "Identify relevant domain principles and audit the reasoning for logical or computational errors. Pass your current draft answer via current_draft.",
-                "parameters": {"type": "object", "properties": verifier_properties, "required": required},
-            },
-        },
-    ]
+    from ..manager.prompt import build_manager_tool_schemas
+    return build_manager_tool_schemas(binding_mode)
 
 
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+# Two native tool-call formats exist across Qwen generations:
+#   Qwen2.5/Qwen3:  <tool_call>{"name": ..., "arguments": {...}}</tool_call>
+#   Qwen3.5:        <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n
+#                   </parameter>\n</function>\n</tool_call>
+# Eval must parse whichever the manager's template taught it to emit.
+_TOOL_CALL_JSON_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+_TOOL_CALL_XML_RE = re.compile(
+    r"<tool_call>\s*<function=(?P<name>[^\n>]+)>(?P<body>[\s\S]*?)</function>\s*</tool_call>",
+    re.IGNORECASE,
+)
+_TOOL_CALL_PARAM_RE = re.compile(
+    r"<parameter=(?P<key>[^>\n]+)>\s*(?P<value>[\s\S]*?)\s*</parameter>", re.IGNORECASE
+)
+_TOOL_CALL_ANY_RE = re.compile(r"<tool_call>[\s\S]*?</tool_call>", re.IGNORECASE)
+_THINK_BLOCK_RE = re.compile(r"^\s*<think>[\s\S]*?</think>\s*", re.IGNORECASE)
+
+
+def _parse_tool_arg_value(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
 
 
 def _extract_manager_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """Parse Qwen-style XML tool calls emitted by the chat template."""
+    """Parse native tool calls (Qwen3 JSON or Qwen3.5 XML) from a completion."""
+    text = _THINK_BLOCK_RE.sub("", text or "")
     calls: List[Dict[str, Any]] = []
-    for m in _TOOL_CALL_RE.finditer(text or ""):
+    for m in _TOOL_CALL_JSON_RE.finditer(text):
         try:
             obj = json.loads(m.group(1))
         except Exception:
@@ -1677,7 +1661,15 @@ def _extract_manager_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
                 args = {}
         if name:
             calls.append({"name": name, "arguments": args if isinstance(args, dict) else {}})
-    content = _TOOL_CALL_RE.sub("", text or "").strip()
+    for m in _TOOL_CALL_XML_RE.finditer(text):
+        name = m.group("name").strip()
+        args = {
+            p.group("key").strip(): _parse_tool_arg_value(p.group("value"))
+            for p in _TOOL_CALL_PARAM_RE.finditer(m.group("body"))
+        }
+        if name:
+            calls.append({"name": name, "arguments": args})
+    content = _TOOL_CALL_ANY_RE.sub("", text).strip()
     return content, calls
 
 
@@ -1694,7 +1686,10 @@ def _tool_call_message(
             "type": "function",
             "function": {
                 "name": tool_name,
-                "arguments": json.dumps(args, ensure_ascii=False),
+                # HF chat templates require `arguments` to be a mapping; the
+                # Qwen3.5 template raises "Can only get item pairs from a
+                # mapping" on a JSON string (the OpenAI wire format).
+                "arguments": dict(args),
             },
         }],
     }
@@ -1709,6 +1704,11 @@ def _load_manager_for_eval(ctx: StageContext, manager_dir: str, device: str, dty
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token_id = tok.eos_token_id
     tok.padding_side = "left"
+    # Older checkpoints saved the shipped THINK template; normalize its default
+    # so eval prompts do not end with an open <think> tag (which makes the
+    # nothink-SFT'd manager unparseable — see src/utils/chat_template.py).
+    from ..utils.chat_template import ensure_nothink_chat_template
+    ensure_nothink_chat_template(tok, tag="EVAL")
 
     is_full = (
         os.path.exists(os.path.join(manager_dir, "config.json"))

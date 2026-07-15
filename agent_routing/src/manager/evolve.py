@@ -37,8 +37,10 @@ try:
 except Exception:
     PEFT_AVAILABLE = False
 
+from ..utils.chat_template import ensure_nothink_chat_template
 from .prompt import (
     build_manager_system_prompt,
+    build_manager_tool_schemas,
     build_manager_user_message,
     parse_final_answer,
 )
@@ -169,7 +171,11 @@ def _tool_call_message(
         "tool_calls": [{
             "id": call_id,
             "type": "function",
-            "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
+            # HF chat templates require a mapping here; the Qwen3.5 template
+            # raises "Can only get item pairs from a mapping" on the OpenAI
+            # wire format (a JSON string). _normalize_tool_args still converts
+            # string arguments found in older JSONL rows.
+            "function": {"name": tool_name, "arguments": dict(args)},
         }],
     }
     if content:
@@ -218,13 +224,15 @@ class _RemoteManagerDraftGenerator:
         request_messages = [dict(m) for m in messages]
         request_messages[0] = dict(request_messages[0])
         request_messages[0]["content"] = str(request_messages[0].get("content") or "") + calibration
+        # NOTE: this is a raw JSON payload, not an openai-python call —
+        # "extra_body" is a client-library concept and must not appear here.
+        # vLLM reads chat_template_kwargs at the top level.
         payload = {
             "model": self.model_name,
             "messages": request_messages,
             "temperature": 0.0,
             "max_tokens": self.max_new_tokens,
-            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
-          "chat_template_kwargs": {"enable_thinking": False}
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         resp = _requests.post(
             f"{self.server_url}/v1/chat/completions",
@@ -280,6 +288,7 @@ def _predict_base_initial_drafts(
     tok = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token_id = tok.eos_token_id
+    ensure_nothink_chat_template(tok, tag="COLDSTART_DRAFTS")
     model = load_text_causal_lm(
         base_model, torch_dtype=dtype, trust_remote_code=True
     ).to(device)
@@ -929,6 +938,12 @@ class ManagerSFTConfig:
     lora_dropout: float = 0.05
     max_steps: int = -1
     bf16: bool = True
+    # Render the tool schemas into the SFT prompts so the SFT distribution
+    # matches GRPO/eval rollouts, where the chat template injects a "# Tools"
+    # section. Training without it teaches tool calls the model never sees
+    # advertised at rollout time.
+    binding_mode: str = "environment"
+    include_tool_schemas: bool = True
 
 def _normalize_tool_args(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """HF chat templates want tool_call arguments as a dict; the OpenAI API wants a JSON string."""
@@ -951,23 +966,26 @@ def _normalize_tool_args(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             m["tool_calls"] = tcs
         out.append(m)
     return out
-def _render_chat(tokenizer, messages, add_generation_prompt: bool) -> str:
+def _render_chat(tokenizer, messages, add_generation_prompt: bool, tools=None) -> str:
     messages = _normalize_tool_args(messages)
     try:
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=add_generation_prompt,
-            enable_thinking=False,
+            tools=tools, enable_thinking=False,
         )
     except TypeError:
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=add_generation_prompt,
+            tools=tools,
         )
 
 
-def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) -> Dataset:
+def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int, tools=None) -> Dataset:
     eos = tok.eos_token or ""
+    prefix_mismatches = 0
 
     def _map(ex: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal prefix_mismatches
         prompt_msgs = ex["prompt"]
         response_msgs = ex["response"]
         if isinstance(response_msgs, dict):
@@ -975,14 +993,33 @@ def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) -> 
         elif isinstance(response_msgs, str):
             response_msgs = [{"role": "assistant", "content": response_msgs}]
 
-        prompt_text = _render_chat(tok, prompt_msgs, add_generation_prompt=True)
-        full_text = _render_chat(tok, prompt_msgs + response_msgs, add_generation_prompt=False) + eos
+        prompt_text = _render_chat(tok, prompt_msgs, add_generation_prompt=True, tools=tools)
+        full_text = _render_chat(
+            tok, prompt_msgs + response_msgs, add_generation_prompt=False, tools=tools
+        )
+        # Chat templates already close the assistant turn with EOS (e.g.
+        # "<|im_end|>\n"); appending another EOS would teach the model to emit
+        # a duplicate end-of-turn token.
+        if eos and eos not in full_text[-(len(eos) + 8):]:
+            full_text = full_text + eos
 
         prompt_ids = tok(prompt_text, add_special_tokens=False)["input_ids"]
         full = tok(full_text, add_special_tokens=False)
+        # The label mask assumes token-level prefix identity between the
+        # rendered prompt and the full conversation. Verify instead of hoping:
+        # a mismatched boundary silently trains on (or masks) the wrong span.
+        plen = len(prompt_ids)
+        if full["input_ids"][:plen] != prompt_ids:
+            common = 0
+            for a, b in zip(full["input_ids"], prompt_ids):
+                if a != b:
+                    break
+                common += 1
+            plen = common
+            prefix_mismatches += 1
         input_ids = full["input_ids"][:max_seq_len]
         attention_mask = full["attention_mask"][:max_seq_len]
-        plen = min(len(prompt_ids), max_seq_len)
+        plen = min(plen, max_seq_len)
         labels = ([-100] * plen) + input_ids[plen:]
         labels = labels[:max_seq_len]
         if len(labels) < len(input_ids):
@@ -991,7 +1028,14 @@ def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) -> 
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
     ds = Dataset.from_list(rows)
-    return ds.map(_map, remove_columns=ds.column_names)
+    mapped = ds.map(_map, remove_columns=ds.column_names)
+    if prefix_mismatches:
+        print(
+            f"[MANAGER_SFT] WARNING: {prefix_mismatches} rows had a "
+            f"prompt/full tokenization boundary mismatch; label masks were "
+            f"realigned to the longest common token prefix."
+        )
+    return mapped
 
 
 def train_manager_sft(cfg: ManagerSFTConfig) -> None:
@@ -1002,6 +1046,9 @@ def train_manager_sft(cfg: ManagerSFTConfig) -> None:
     tok.padding_side = "left"
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token_id = tok.eos_token_id
+    # Match GRPO/eval: normalize the template default to nothink so the SFT
+    # target format is exactly what the rollout-time parser expects.
+    ensure_nothink_chat_template(tok, tag="MANAGER_SFT")
 
     dtype = torch.bfloat16 if (cfg.bf16 and device == "cuda") else torch.float32
     model = load_text_causal_lm(
@@ -1021,8 +1068,15 @@ def train_manager_sft(cfg: ManagerSFTConfig) -> None:
     rows = read_jsonl(cfg.train_jsonl)
     if not rows:
         raise ValueError(f"No rows in {cfg.train_jsonl}")
-    print(f"[MANAGER_SFT] tokenizing {len(rows)} rows ...")
-    train_ds = _tokenize_manager_sft(rows, tok, cfg.max_seq_len)
+    tools = (
+        build_manager_tool_schemas(cfg.binding_mode)
+        if cfg.include_tool_schemas else None
+    )
+    print(
+        f"[MANAGER_SFT] tokenizing {len(rows)} rows "
+        f"(tool schemas in prompt: {bool(tools)}, binding={cfg.binding_mode}) ..."
+    )
+    train_ds = _tokenize_manager_sft(rows, tok, cfg.max_seq_len, tools=tools)
     total_steps = (len(train_ds) // (cfg.per_device_batch_size * cfg.gradient_accumulation_steps)) * cfg.num_train_epochs
     if cfg.max_steps > 0:
         total_steps = min(total_steps, cfg.max_steps)

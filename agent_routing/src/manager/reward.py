@@ -51,6 +51,9 @@ from .prompt import extract_answer_sequence, parse_final_answer
 _TOOL_CALL_TAG_RE   = re.compile(r"<tool_call>", re.IGNORECASE)
 _TOOLS_TAG_RE       = re.compile(r"<tools>", re.IGNORECASE)
 _TOOL_CALLS_FIELD_RE = re.compile(r'"tool_calls"\s*:', re.IGNORECASE)
+# Qwen3.5 renders native tool calls as <function=...>/<parameter=...> XML;
+# those tags leaking into plain assistant text are artifacts too.
+_TOOL_XML_TAG_RE    = re.compile(r"<function=|<parameter=", re.IGNORECASE)
 _TOOL_NAMES = ("extractor_tool", "reasoner_tool", "verifier_tool")
 
 
@@ -62,6 +65,8 @@ def _has_plaintext_tool_artifacts(text: str) -> bool:
     if _TOOLS_TAG_RE.search(text):
         return True
     if _TOOL_CALLS_FIELD_RE.search(text):
+        return True
+    if _TOOL_XML_TAG_RE.search(text):
         return True
     for name in _TOOL_NAMES:
         if re.search(rf"\b{re.escape(name)}\s*[\(\{{:]", text, flags=re.IGNORECASE):

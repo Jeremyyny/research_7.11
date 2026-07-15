@@ -352,13 +352,15 @@ class RemoteSubagentPool:
             candidate_answer=candidate_answer,
         )
         cap = self.max_new_tokens_for(agent_kind)
+        # Raw JSON payload for vLLM's OpenAI-compatible server: it reads
+        # chat_template_kwargs at the top level. ("extra_body" is an
+        # openai-python client concept and must not be sent on the wire.)
         payload = {
             "model": agent_kind,
             "messages": messages,
             "temperature": 0.0,
             "max_tokens": cap,
-          "chat_template_kwargs": {"enable_thinking": False},
-            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         resp = _requests.post(
             f"{self._server_url}/v1/chat/completions",
