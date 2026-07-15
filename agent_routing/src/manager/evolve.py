@@ -727,11 +727,15 @@ def build_manager_sft_from_rows(
 
     if out_path is None:
         out_path = os.path.join(cfg.out_dir, "manager_sft_coldstart.jsonl")
+    seqs = [r["draft_sequence"] for r in sft_rows if "draft_sequence" in r]
+    n_changed = sum(1 for s in seqs if len(set(s)) > 1)
     write_jsonl(out_path, sft_rows)
     write_json(out_path + ".meta.json", {
         "n_examples": len(sample),
         "n_sft_rows": len(sft_rows),
         "available_kinds": available_kinds,
+        "draft_changed_after_tools": n_changed,          # ← 新增
+        "draft_change_rate": round(n_changed / max(1, len(seqs)), 3),  # ← 新增
         "binding_mode": cfg.binding_mode,
         "draft_source": cfg.draft_source,
         "n_parseable_drafts": len(sample),
