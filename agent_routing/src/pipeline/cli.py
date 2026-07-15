@@ -158,11 +158,18 @@ def _parse_args() -> argparse.Namespace:
                         help="Balance synthetic rows by task_subtype or metadata:<key>. "
                              "Use task_subtype for LegalBench large5.")
     parser.add_argument("--synth_verifier_candidate_jsonl", type=str, default="",
-                        help="JSONL with example_id and pred/prediction/answer fields. "
-                             "Verifier audits these real manager predictions.")
+                        help="JSONL with example_id, question_hash, and a "
+                             "pred/prediction/answer field. Verifier audits these real "
+                             "manager predictions.")
     parser.add_argument("--synth_random_verifier_candidates", action="store_true",
                         help="Legacy fallback: use random verifier candidates when no real "
                              "prediction exists. Not recommended for main experiments.")
+    parser.add_argument("--synth_allow_empty_verifier_candidates", action="store_true",
+                        help="Explicit generic-verifier ablation with no candidate answer. "
+                             "Never use for main experiments.")
+    parser.add_argument("--synth_min_verifier_candidate_coverage", type=float, default=0.95,
+                        help="Minimum parseable manager-prediction coverage required before "
+                             "exporting verifier prompts (default 0.95).")
     parser.add_argument("--deepseek_prompt_jsonl", type=str, default="",
                         help="Prompt JSONL for local DeepSeek batch generation.")
     parser.add_argument("--deepseek_response_jsonl", type=str, default="",
@@ -625,6 +632,10 @@ def main() -> None:
             agent_kind=args.agent_kind,
             out_path=out_path,
             n_samples=args.n_samples,
+            verifier_candidate_jsonl=args.synth_verifier_candidate_jsonl,
+            random_verifier_candidates=args.synth_random_verifier_candidates,
+            allow_empty_verifier_candidates=args.synth_allow_empty_verifier_candidates,
+            min_verifier_candidate_coverage=args.synth_min_verifier_candidate_coverage,
         )
         print("[EXPORT_LEGALBENCH_JSONL]", result)
         return
@@ -661,6 +672,8 @@ def main() -> None:
             stratify_by=args.synth_stratify_by,
             verifier_candidate_jsonl=args.synth_verifier_candidate_jsonl,
             random_verifier_candidates=args.synth_random_verifier_candidates,
+            allow_empty_verifier_candidates=args.synth_allow_empty_verifier_candidates,
+            min_verifier_candidate_coverage=args.synth_min_verifier_candidate_coverage,
         )
         print("[SYNTH]", result)
         return
@@ -679,6 +692,8 @@ def main() -> None:
             stratify_by=args.synth_stratify_by,
             verifier_candidate_jsonl=args.synth_verifier_candidate_jsonl,
             random_verifier_candidates=args.synth_random_verifier_candidates,
+            allow_empty_verifier_candidates=args.synth_allow_empty_verifier_candidates,
+            min_verifier_candidate_coverage=args.synth_min_verifier_candidate_coverage,
         )
         print("[EXPORT_DEEPSEEK_JSONL]", result)
         return
@@ -698,6 +713,7 @@ def main() -> None:
             teacher_model=args.deepseek_teacher_model,
             raw_responses=args.deepseek_import_raw_responses,
             symmetric_leakage=args.synth_symmetric_leakage,
+            allow_empty_verifier_candidates=args.synth_allow_empty_verifier_candidates,
         )
         print("[IMPORT_DEEPSEEK_JSONL]", result)
         return

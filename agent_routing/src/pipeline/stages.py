@@ -37,6 +37,12 @@ from ..utils.cache import TeacherCallCache
 from ..utils.io import read_jsonl, write_json, write_jsonl
 from ..utils.leakage import LeakageAuditor
 from ..utils.seed import set_seed
+from ..verifier_candidates import (
+    MIN_VERIFIER_CANDIDATE_COVERAGE,
+    load_validated_prediction_map,
+    require_verifier_candidate_coverage,
+    validate_candidate_bound_prompt_rows,
+)
 
 
 # --------------------- Context ---------------------
@@ -351,23 +357,9 @@ def run_export_base_predictions(
         "out_path": out_path,
         "n_requested": len(sample),
         "n_parseable": len(records),
+        "parseable_rate": len(records) / max(1, len(sample)),
         "accuracy": sum(r["correct"] for r in records) / max(1, len(records)),
     }
-
-def _load_prediction_map(path: str) -> Dict[int, str]:
-    if not path:
-        return {}
-    out: Dict[int, str] = {}
-    for row in read_jsonl(path):
-        eid = row.get("example_id")
-        if eid is None:
-            continue
-        pred = row.get("pred", row.get("prediction", row.get("answer", "")))
-        try:
-            out[int(eid)] = str(pred or "").strip()
-        except Exception:
-            continue
-    return out
 
 def run_synthesize_subagent(
     ctx: StageContext,
@@ -384,6 +376,8 @@ def run_synthesize_subagent(
     stratify_by: str = "",
     verifier_candidate_jsonl: str = "",
     random_verifier_candidates: bool = False,
+    allow_empty_verifier_candidates: bool = False,
+    min_verifier_candidate_coverage: float = MIN_VERIFIER_CANDIDATE_COVERAGE,
 ) -> Dict[str, Any]:
     from ..subagents.schemas import AgentKind
     from ..subagents.synthesize import synthesize_subagent_data
@@ -395,6 +389,30 @@ def run_synthesize_subagent(
 
     out_path = ctx.sft_jsonl_path(agent_kind.value)
     log_path = ctx.sft_log_path(agent_kind.value)
+
+    candidate_map: Dict[int, str] = {}
+    candidate_stats: Dict[str, Any] = {}
+    if agent_kind == AgentKind.VERIFIER and not random_verifier_candidates:
+        if allow_empty_verifier_candidates:
+            candidate_stats = {"verifier_candidate_mode": "explicitly_empty"}
+        else:
+            if not verifier_candidate_jsonl:
+                raise ValueError(
+                    "Verifier synthesis requires --synth_verifier_candidate_jsonl. "
+                    "Use --synth_allow_empty_verifier_candidates only for an explicit "
+                    "generic-verifier ablation, never for the main experiment."
+                )
+            candidate_map = load_validated_prediction_map(verifier_candidate_jsonl, rows)
+            from ..subagents.synthesize import _balanced_pool
+            coverage_rows = _balanced_pool(rows, stratify_by, ctx.seed)
+            if n_samples > 0:
+                coverage_rows = coverage_rows[:n_samples]
+            candidate_stats = require_verifier_candidate_coverage(
+                coverage_rows, candidate_map, min_verifier_candidate_coverage
+            )
+    elif agent_kind == AgentKind.VERIFIER:
+        candidate_map = load_validated_prediction_map(verifier_candidate_jsonl, rows)
+        candidate_stats = {"verifier_candidate_mode": "legacy_random_fallback"}
 
     stats = synthesize_subagent_data(
         rows=rows,
@@ -411,8 +429,9 @@ def run_synthesize_subagent(
         max_workers=max_workers,
         symmetric_leakage=symmetric_leakage,
         stratify_by=stratify_by,
-        verifier_candidate_map=_load_prediction_map(verifier_candidate_jsonl),
+        verifier_candidate_map=candidate_map,
         random_verifier_candidates=random_verifier_candidates,
+        allow_empty_verifier_candidates=allow_empty_verifier_candidates,
     )
 
     return {
@@ -422,6 +441,7 @@ def run_synthesize_subagent(
         "out_path": out_path,
         "log_path": log_path,
         "stats": stats.__dict__,
+        **candidate_stats,
     }
 
 
@@ -436,6 +456,8 @@ def run_export_deepseek_subagent_prompts(
     stratify_by: str = "",
     verifier_candidate_jsonl: str = "",
     random_verifier_candidates: bool = False,
+    allow_empty_verifier_candidates: bool = False,
+    min_verifier_candidate_coverage: float = MIN_VERIFIER_CANDIDATE_COVERAGE,
 ) -> Dict[str, Any]:
     """Write JSONL prompts for a local batch generator.
 
@@ -452,7 +474,28 @@ def run_export_deepseek_subagent_prompts(
     sample = _balanced_pool(rows, stratify_by, ctx.seed)
     sample = sample[:n_samples] if n_samples > 0 else sample
     kind_value = _agent_kind_value(agent_kind)
-    candidate_map = _load_prediction_map(verifier_candidate_jsonl)
+    candidate_map: Dict[int, str] = {}
+    candidate_stats: Dict[str, Any] = {}
+    if kind_value == "verifier" and not random_verifier_candidates:
+        if allow_empty_verifier_candidates:
+            candidate_stats = {"verifier_candidate_mode": "explicitly_empty"}
+        else:
+            if not verifier_candidate_jsonl:
+                raise ValueError(
+                    "Verifier prompt export requires --synth_verifier_candidate_jsonl. "
+                    "Generate GT-blind base-manager predictions first."
+                )
+            candidate_map = load_validated_prediction_map(verifier_candidate_jsonl, sample)
+            candidate_stats = require_verifier_candidate_coverage(
+                sample, candidate_map, min_verifier_candidate_coverage
+            )
+            # Never emit generic verifier prompts accidentally. The raw role
+            # files may differ in size; shared-row selection handles this after
+            # response validation.
+            sample = [r for r in sample if int(r.example_id) in candidate_map]
+    elif kind_value == "verifier":
+        candidate_map = load_validated_prediction_map(verifier_candidate_jsonl, sample)
+        candidate_stats = {"verifier_candidate_mode": "legacy_random_fallback"}
 
     if out_path is None:
         out_path = os.path.join(ctx.sft_data_root, f"{kind_value}_deepseek_prompts.jsonl")
@@ -496,7 +539,12 @@ def run_export_deepseek_subagent_prompts(
         })
 
     write_jsonl(out_path, out_rows)
-    return {"agent_kind": kind_value, "out_path": out_path, "n_rows": len(out_rows)}
+    return {
+        "agent_kind": kind_value,
+        "out_path": out_path,
+        "n_rows": len(out_rows),
+        **candidate_stats,
+    }
 
 
 def run_import_deepseek_subagent_responses(
@@ -509,6 +557,7 @@ def run_import_deepseek_subagent_responses(
     teacher_model: str = "deepseek-local",
     raw_responses: bool = False,
     symmetric_leakage: bool = True,
+    allow_empty_verifier_candidates: bool = False,
 ) -> Dict[str, Any]:
     """Convert local JSONL responses into subagent SFT rows.
 
@@ -535,6 +584,8 @@ def run_import_deepseek_subagent_responses(
 
     prompt_rows = read_jsonl(prompt_jsonl)
     response_rows = read_jsonl(response_jsonl)
+    if kind_value == "verifier" and not allow_empty_verifier_candidates:
+        validate_candidate_bound_prompt_rows(prompt_rows)
     prompt_by_id = {int(r["example_id"]): r for r in prompt_rows if r.get("example_id") is not None}
 
     auditor = LeakageAuditor()

@@ -632,6 +632,10 @@ cold-start, GRPO, dev selection, prompt tuning, or reward tuning.
 
 ## 7.2 Base predictions and synthetic data
 
+The verifier-specific rationale, artifact contract, preflight checks, and
+recovery steps are documented in
+`outputs/sft_data/adc_gpqa_nondiamond_ds/README.md`.
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.cli export_base_predictions \
   --base_model "$BASE_MODEL" --teacher_id "$ID" $TRAIN_ARGS \
@@ -646,6 +650,16 @@ for KIND in extractor reasoner verifier; do
     --synth_verifier_candidate_jsonl outputs/sft_data/$ID/base_predictions.jsonl \
     --deepseek_prompt_jsonl outputs/sft_data/$ID/${KIND}_prompts_raw.jsonl
 
+done
+
+python scripts/audit_deepseek_prompts.py \
+  outputs/sft_data/$ID/extractor_prompts_raw.jsonl \
+  outputs/sft_data/$ID/reasoner_prompts_raw.jsonl \
+  outputs/sft_data/$ID/verifier_prompts_raw.jsonl \
+  --min_rows 190 --require_verifier_candidates \
+  --min_verifier_candidate_coverage 1.0
+
+for KIND in extractor reasoner verifier; do
   python scripts/generate_openai_compatible_jsonl.py \
     --input outputs/sft_data/$ID/${KIND}_prompts_raw.jsonl \
     --output outputs/sft_data/$ID/${KIND}_responses_raw.jsonl \
